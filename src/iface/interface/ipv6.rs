@@ -699,25 +699,12 @@ impl Interface {
                         // Routes from another address family cannot conflict.
                         _ => true,
                     }) {
-                        let result = routes.push(Route {
+                        let _ = routes.push(Route {
                             cidr: route.cidr.into(),
                             via_router: route.via_router.into(),
                             preferred_until: None,
                             expires_at: None,
                         });
-                        if result.is_ok() {
-                            net_info!(
-                                "IPv6 SLAAC route installed: {} via {}",
-                                route.cidr,
-                                route.via_router
-                            );
-                        } else {
-                            net_info!(
-                                "IPv6 SLAAC route NOT installed (route table full): {} via {}",
-                                route.cidr,
-                                route.via_router
-                            );
-                        }
                     }
                 }
             });
