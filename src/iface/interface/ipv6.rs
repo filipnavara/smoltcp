@@ -107,24 +107,33 @@ impl InterfaceInner {
                 continue;
             }
 
-            // Rule 1: prefer the address that is the same as the output destination address.
-            if candidate.address() != *dst_addr && addr.address() == *dst_addr {
+            if !is_candidate_source_address(dst_addr, &candidate.address()) {
                 candidate = addr;
+                continue;
+            }
+
+            // Rule 1: prefer the address that is the same as the output destination address.
+            if candidate.address() == *dst_addr {
+                break;
+            } else if addr.address() == *dst_addr {
+                candidate = addr;
+                break;
             }
 
             // Rule 2: prefer appropriate scope.
-            if (candidate.address().x_multicast_scope() as u8)
-                < (addr.address().x_multicast_scope() as u8)
-            {
-                if (candidate.address().x_multicast_scope() as u8)
-                    < (dst_addr.x_multicast_scope() as u8)
-                {
+            let candidate_scope = candidate.address().x_multicast_scope() as u8;
+            let addr_scope = addr.address().x_multicast_scope() as u8;
+            let destination_scope = dst_addr.x_multicast_scope() as u8;
+            if candidate_scope < addr_scope {
+                if candidate_scope < destination_scope {
                     candidate = addr;
                 }
-            } else if (addr.address().x_multicast_scope() as u8)
-                > (dst_addr.x_multicast_scope() as u8)
-            {
-                candidate = addr;
+                continue;
+            } else if addr_scope < candidate_scope {
+                if addr_scope >= destination_scope {
+                    candidate = addr;
+                }
+                continue;
             }
 
             // Rule 3: avoid deprecated addresses (TODO)

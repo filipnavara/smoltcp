@@ -1343,6 +1343,23 @@ fn get_source_address() {
         iface.get_source_address_ipv6(&GLOBAL_UNICAST_ADDR2),
         OWN_GLOBAL_UNICAST_ADDR1
     );
+
+    // Address ordering must not let the longest-prefix rule override the
+    // higher-priority scope rule. Embassy rebuilds its address list in this
+    // order after DHCP completes.
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        addrs
+            .push(IpCidr::Ipv6(Ipv6Cidr::new(OWN_GLOBAL_UNICAST_ADDR1, 64)))
+            .unwrap();
+        addrs
+            .push(IpCidr::Ipv6(Ipv6Cidr::new(OWN_LINK_LOCAL_ADDR, 64)))
+            .unwrap();
+    });
+    assert_eq!(
+        iface.get_source_address_ipv6(&UNIQUE_LOCAL_ADDR1),
+        OWN_GLOBAL_UNICAST_ADDR1
+    );
 }
 
 #[cfg(feature = "medium-ip")]
