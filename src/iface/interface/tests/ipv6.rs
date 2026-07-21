@@ -899,6 +899,10 @@ fn test_router_advertisement(#[case] medium: Medium) {
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs.push(IpCidr::Ipv6(local_ip_addr)).unwrap();
     });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 0, 2, 1))
+        .unwrap();
 
     let mut sockets = SocketSet::new(vec![]);
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
@@ -987,6 +991,16 @@ fn test_router_advertisement(#[case] medium: Medium) {
     );
 
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
+
+    // An unrelated IPv4 route must not prevent synchronization of an IPv6
+    // route learned from a Router Advertisement.
+    iface.routes_mut().update(|routes| {
+        assert!(routes.iter().any(|route| {
+            route.cidr == IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0)
+                && route.via_router == IpAddress::Ipv6(remote_ip_addr.address())
+        }));
+    });
+    iface.routes_mut().remove_default_ipv4_route();
 
     // Expect to have these two addresses after the router advertisement
     let expected_addrs = [

@@ -687,7 +687,8 @@ impl Interface {
                         (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
                             !route.same_route(cidr, via_router)
                         }
-                        _ => false,
+                        // Routes from another address family cannot conflict.
+                        _ => true,
                     }) {
                         let _ = routes.push(Route {
                             cidr: route.cidr.into(),
