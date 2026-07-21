@@ -20,7 +20,9 @@ enum_with_unknown! {
         /// Redirected Header
         RedirectedHeader    = 0x4,
         /// MTU
-        Mtu                 = 0x5
+        Mtu                 = 0x5,
+        /// Route Information
+        RouteInformation    = 0x18
     }
 }
 
@@ -32,6 +34,7 @@ impl fmt::Display for Type {
             Type::PrefixInformation => write!(f, "prefix information"),
             Type::RedirectedHeader => write!(f, "redirected header"),
             Type::Mtu => write!(f, "mtu"),
+            Type::RouteInformation => write!(f, "route information"),
             Type::Unknown(id) => write!(f, "{id}"),
         }
     }
@@ -140,6 +143,12 @@ mod field {
 
     //  MTU
     pub const MTU: Field = 4..8;
+
+    // Route Information Option fields (RFC 4191 section 2.3).
+    pub const ROUTE_PREFIX_LEN: usize = 2;
+    pub const ROUTE_PREFERENCE: usize = 3;
+    pub const ROUTE_LIFETIME: Field = 4..8;
+    pub const ROUTE_PREFIX: usize = 8;
 }
 
 /// Core getter methods relevant to any type of NDISC option.
@@ -185,6 +194,12 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                 match self.option_type() {
                     Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
+                    Type::RouteInformation
+                        if matches!(data[field::LENGTH], 1..=3)
+                            && data[field::ROUTE_PREFIX_LEN] <= (data[field::LENGTH] - 1) * 64 =>
+                    {
+                        Ok(())
+                    }
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
                     Type::Unknown(_) => Ok(()),
                     _ => Err(Error),
@@ -231,6 +246,49 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     pub fn mtu(&self) -> u32 {
         let data = self.buffer.as_ref();
         NetworkEndian::read_u32(&data[field::MTU])
+    }
+}
+
+/// Getter methods only relevant for the Route Information option.
+impl<T: AsRef<[u8]>> NdiscOption<T> {
+    /// Return the advertised route's prefix length.
+    #[inline]
+    pub fn route_prefix_len(&self) -> u8 {
+        self.buffer.as_ref()[field::ROUTE_PREFIX_LEN]
+    }
+
+    /// Return the route preference bits defined by RFC 4191.
+    #[inline]
+    pub fn route_preference(&self) -> u8 {
+        (self.buffer.as_ref()[field::ROUTE_PREFERENCE] >> 3) & 0x03
+    }
+
+    /// Return the route lifetime.
+    #[inline]
+    pub fn route_lifetime(&self) -> Duration {
+        let data = self.buffer.as_ref();
+        Duration::from_secs(NetworkEndian::read_u32(&data[field::ROUTE_LIFETIME]) as u64)
+    }
+
+    /// Return the route prefix, zero-extending the abbreviated representation.
+    #[inline]
+    pub fn route_prefix(&self) -> Ipv6Address {
+        let mut octets = [0; 16];
+        let prefix_bytes = (self.data_len() as usize - 1) * 8;
+        let data = self.buffer.as_ref();
+        octets[..prefix_bytes]
+            .copy_from_slice(&data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_bytes]);
+
+        let prefix_len = self.route_prefix_len() as usize;
+        let whole_bytes = prefix_len / 8;
+        let remaining_bits = prefix_len % 8;
+        if remaining_bits != 0 {
+            octets[whole_bytes] &= 0xff << (8 - remaining_bits);
+        }
+        let zero_from = whole_bytes + usize::from(remaining_bits != 0);
+        octets[zero_from..].fill(0);
+
+        Ipv6Address::from_octets(octets)
     }
 }
 
@@ -402,6 +460,20 @@ pub struct PrefixInformation {
     pub prefix: Ipv6Address,
 }
 
+/// An IPv6 Route Information Option advertised by a router.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RouteInformation {
+    /// Length of the advertised prefix.
+    pub prefix_len: u8,
+    /// RFC 4191 preference bits: medium (0), high (1), reserved (2), or low (3).
+    pub preference: u8,
+    /// Duration for which the route remains valid.
+    pub route_lifetime: Duration,
+    /// Advertised route prefix.
+    pub prefix: Ipv6Address,
+}
+
 impl PrefixInformation {
     /// Validates the prefix information option against check a, b, c in
     /// <https://www.rfc-editor.org/rfc/rfc4862#section-5.5.3>
@@ -426,6 +498,7 @@ pub enum Repr<'a> {
     SourceLinkLayerAddr(RawHardwareAddress),
     TargetLinkLayerAddr(RawHardwareAddress),
     PrefixInformation(PrefixInformation),
+    RouteInformation(RouteInformation),
     RedirectedHeader(RedirectedHeader<'a>),
     Mtu(u32),
     Unknown {
@@ -471,6 +544,12 @@ impl<'a> Repr<'a> {
                     Err(Error)
                 }
             }
+            Type::RouteInformation => Ok(Repr::RouteInformation(RouteInformation {
+                prefix_len: opt.route_prefix_len(),
+                preference: opt.route_preference(),
+                route_lifetime: opt.route_lifetime(),
+                prefix: opt.route_prefix(),
+            })),
             Type::RedirectedHeader => {
                 // If the options data length is less than 6, the option
                 // does not have enough data to fill out the IP header
@@ -520,6 +599,15 @@ impl<'a> Repr<'a> {
                 len.div_ceil(8) * 8
             }
             &Repr::PrefixInformation(_) => field::PREFIX.end,
+            &Repr::RouteInformation(RouteInformation { prefix_len, .. }) => {
+                if prefix_len == 0 {
+                    8
+                } else if prefix_len <= 64 {
+                    16
+                } else {
+                    24
+                }
+            }
             &Repr::RedirectedHeader(RedirectedHeader { header, data }) => {
                 (8 + header.buffer_len() + data.len()).div_ceil(8) * 8
             }
@@ -561,6 +649,32 @@ impl<'a> Repr<'a> {
                 opt.set_valid_lifetime(valid_lifetime);
                 opt.set_preferred_lifetime(preferred_lifetime);
                 opt.set_prefix(prefix);
+            }
+            Repr::RouteInformation(RouteInformation {
+                prefix_len,
+                preference,
+                route_lifetime,
+                prefix,
+            }) => {
+                let length = if prefix_len == 0 {
+                    1
+                } else if prefix_len <= 64 {
+                    2
+                } else {
+                    3
+                };
+                opt.set_option_type(Type::RouteInformation);
+                opt.set_data_len(length);
+                let data = opt.buffer.as_mut();
+                data[field::ROUTE_PREFIX_LEN] = prefix_len;
+                data[field::ROUTE_PREFERENCE] = (preference & 0x03) << 3;
+                NetworkEndian::write_u32(
+                    &mut data[field::ROUTE_LIFETIME],
+                    route_lifetime.secs() as u32,
+                );
+                let prefix_bytes = (length as usize - 1) * 8;
+                data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_bytes]
+                    .copy_from_slice(&prefix.octets()[..prefix_bytes]);
             }
             Repr::RedirectedHeader(RedirectedHeader { header, data }) => {
                 // TODO(thvdveld): I think we need to check if the data we are sending is not
@@ -606,6 +720,11 @@ impl<'a> fmt::Display for Repr<'a> {
             }) => {
                 write!(f, "PrefixInformation prefix={prefix}/{prefix_len}")
             }
+            Repr::RouteInformation(RouteInformation {
+                prefix, prefix_len, ..
+            }) => {
+                write!(f, "RouteInformation prefix={prefix}/{prefix_len}")
+            }
             Repr::RedirectedHeader(RedirectedHeader { header, .. }) => {
                 write!(f, "RedirectedHeader header={header}")
             }
@@ -645,7 +764,7 @@ impl<T: AsRef<[u8]>> PrettyPrint for NdiscOption<T> {
 #[cfg(test)]
 mod test {
     use super::Error;
-    use super::{NdiscOption, PrefixInfoFlags, PrefixInformation, Repr, Type};
+    use super::{NdiscOption, PrefixInfoFlags, PrefixInformation, Repr, RouteInformation, Type};
     use crate::time::Duration;
     use crate::wire::Ipv6Address;
 
@@ -658,6 +777,11 @@ mod test {
         0x03, 0x04, 0x40, 0xc0, 0x00, 0x00, 0x03, 0x84, 0x00, 0x00, 0x03, 0xe8, 0x00, 0x00, 0x00,
         0x00, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x01,
+    ];
+
+    static ROUTE_OPT_BYTES: [u8; 16] = [
+        0x18, 0x02, 0x40, 0x08, 0x00, 0x00, 0x07, 0x08, 0xfd, 0xcf, 0x41, 0x7d, 0xe1, 0x6a, 0x00,
+        0x01,
     ];
 
     #[test]
@@ -776,5 +900,23 @@ mod test {
             Repr::parse(&NdiscOption::new_unchecked(&bytes)),
             Ok(Repr::Mtu(1500))
         );
+    }
+
+    #[test]
+    fn test_repr_parse_route_info() {
+        let repr = Repr::RouteInformation(RouteInformation {
+            prefix_len: 64,
+            preference: 1,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0xfdcf, 0x417d, 0xe16a, 1, 0, 0, 0, 0),
+        });
+        assert_eq!(
+            Repr::parse(&NdiscOption::new_unchecked(&ROUTE_OPT_BYTES)),
+            Ok(repr)
+        );
+
+        let mut bytes = [0; 16];
+        repr.emit(&mut NdiscOption::new_unchecked(&mut bytes));
+        assert_eq!(bytes, ROUTE_OPT_BYTES);
     }
 }

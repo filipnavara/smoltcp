@@ -958,6 +958,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
         lladdr: None,
         mtu: None,
         prefix_info: Some(prefix_information),
+        route_info: None,
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),

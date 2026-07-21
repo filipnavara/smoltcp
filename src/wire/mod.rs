@@ -261,7 +261,7 @@ pub use self::ndisc::{
 pub use self::ndiscoption::{
     NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags,
     PrefixInformation as NdiscPrefixInformation, RedirectedHeader as NdiscRedirectedHeader,
-    Repr as NdiscOptionRepr, Type as NdiscOptionType,
+    Repr as NdiscOptionRepr, RouteInformation as NdiscRouteInformation, Type as NdiscOptionType,
 };
 
 #[cfg(feature = "proto-ipv6")]

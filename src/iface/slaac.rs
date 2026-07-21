@@ -4,7 +4,9 @@ use heapless::{LinearMap, Vec};
 use crate::config::{IFACE_MAX_PREFIX_COUNT, IFACE_MAX_ROUTE_COUNT};
 use crate::time::{Duration, Instant};
 use crate::wire::NdiscPrefixInfoFlags;
-use crate::wire::{Ipv6Address, Ipv6Cidr, NdiscPrefixInformation, ipv6::AddressExt};
+use crate::wire::{
+    Ipv6Address, Ipv6Cidr, NdiscPrefixInformation, NdiscRouteInformation, ipv6::AddressExt,
+};
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
 const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
@@ -186,6 +188,7 @@ impl Slaac {
         source: &Ipv6Address,
         router_lifetime: Duration,              // default route lifetime
         prefix: Option<NdiscPrefixInformation>, // prefix info
+        route: Option<NdiscRouteInformation>,   // route info
         now: Instant,
     ) {
         if let Some(prefix) = prefix
@@ -198,6 +201,15 @@ impl Slaac {
             self.add_route(&IPV6_DEFAULT, source, now + router_lifetime);
         } else {
             self.expire_route(&IPV6_DEFAULT, source);
+        }
+
+        if let Some(route) = route {
+            let cidr = Ipv6Cidr::new(route.prefix, route.prefix_len);
+            if route.route_lifetime > Duration::ZERO {
+                self.add_route(&cidr, source, now + route.route_lifetime);
+            } else {
+                self.expire_route(&cidr, source);
+            }
         }
 
         // Advertisement might be unsolicited
@@ -311,6 +323,12 @@ mod test {
             prefix: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
         };
         pub const VALID: Duration = Duration::from_secs(600);
+        pub const ROUTE_INFO: NdiscRouteInformation = NdiscRouteInformation {
+            prefix_len: 64,
+            preference: 0,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0xfdcf, 0x417d, 0xe16a, 1, 0, 0, 0, 0),
+        };
 
         pub const ROUTE: Route = Route {
             cidr: Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0),
@@ -336,6 +354,29 @@ mod test {
     fn test_route_valid() {
         assert!(ROUTE.is_valid(Instant::ZERO));
         assert!(!ROUTE.is_valid(Instant::from_secs(200)));
+    }
+
+    #[test]
+    fn test_route_information() {
+        let mut slaac = Slaac::new();
+        let now = Instant::from_secs(10);
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, Some(ROUTE_INFO), now);
+
+        assert_eq!(slaac.routes().len(), 1);
+        let route = slaac.routes()[0];
+        assert_eq!(
+            route.cidr,
+            Ipv6Cidr::new(ROUTE_INFO.prefix, ROUTE_INFO.prefix_len)
+        );
+        assert_eq!(route.via_router, SOURCE);
+        assert_eq!(route.valid_until, now + ROUTE_INFO.route_lifetime);
+
+        let expired = NdiscRouteInformation {
+            route_lifetime: Duration::ZERO,
+            ..ROUTE_INFO
+        };
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, Some(expired), now);
+        assert!(!slaac.routes()[0].is_valid(now));
     }
 
     #[test]
@@ -369,7 +410,7 @@ mod test {
         assert!(!slaac.has_ra_update());
 
         // Unsolicited advertisement
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
         assert_eq!(slaac.phase, Phase::Start);
         assert!(slaac.has_ra_update());
 
@@ -378,8 +419,8 @@ mod test {
         assert_eq!(slaac.phase, Phase::Discovering);
 
         // Solicited advertisement
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), now);
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
         assert_eq!(slaac.phase, Phase::Maintaining);
         let poll_at = slaac.poll_at(now).unwrap();
         assert_eq!(poll_at, now + VALID);
@@ -442,7 +483,7 @@ mod test {
         let mut slaac = Slaac::new();
         let now = Instant::from_millis(1);
         slaac.rs_sent(now);
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
 
         let now = Instant::from_secs(300);
 
@@ -460,7 +501,7 @@ mod test {
         expire_prefix.valid_lifetime = Duration::ZERO;
 
         // Invalidate the prefix, but not the route
-        slaac.process_advertisement(&SOURCE, VALID, Some(expire_prefix), now);
+        slaac.process_advertisement(&SOURCE, VALID, Some(expire_prefix), None, now);
 
         assert!(slaac.sync_required(now));
         for (_prefix, info) in slaac.prefix() {
@@ -475,7 +516,7 @@ mod test {
 
         assert!(!slaac.sync_required(now));
         // Invalidate also the route
-        slaac.process_advertisement(&SOURCE, Duration::ZERO, Some(expire_prefix), now);
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, Some(expire_prefix), None, now);
         assert!(slaac.sync_required(now));
         for route in slaac.routes() {
             assert!(!route.is_valid(now));
