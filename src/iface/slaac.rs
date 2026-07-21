@@ -205,6 +205,13 @@ impl Slaac {
 
         if let Some(route) = route {
             let cidr = Ipv6Cidr::new(route.prefix, route.prefix_len);
+            net_info!(
+                "IPv6 RIO received: {}/{} via {} lifetime {}s",
+                route.prefix,
+                route.prefix_len,
+                source,
+                route.route_lifetime.secs()
+            );
             if route.route_lifetime > Duration::ZERO {
                 self.add_route(&cidr, source, now + route.route_lifetime);
             } else {

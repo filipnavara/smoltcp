@@ -690,6 +690,11 @@ impl Interface {
                         // Routes from another address family cannot conflict.
                         _ => true,
                     }) {
+                        net_info!(
+                            "IPv6 SLAAC route installed: {} via {}",
+                            route.cidr,
+                            route.via_router
+                        );
                         let _ = routes.push(Route {
                             cidr: route.cidr.into(),
                             via_router: route.via_router.into(),
