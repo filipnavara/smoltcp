@@ -1202,6 +1202,19 @@ impl InterfaceInner {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
 
+        #[cfg(feature = "proto-ipv6")]
+        if let (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) =
+            (ip_repr.src_addr(), ip_repr.dst_addr())
+            && destination.is_unique_local()
+        {
+            net_info!(
+                "IPv6 TX: {} -> {} via {:?}",
+                source,
+                destination,
+                self.route(&IpAddress::Ipv6(destination), self.now)
+            );
+        }
+
         // Dispatch IEEE802.15.4:
 
         #[cfg(feature = "medium-ieee802154")]

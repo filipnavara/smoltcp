@@ -191,10 +191,18 @@ impl Slaac {
         route: Option<NdiscRouteInformation>,   // route info
         now: Instant,
     ) {
-        if let Some(prefix) = prefix
-            && prefix.is_valid_prefix_info()
-        {
-            self.process_prefix(prefix, now)
+        if let Some(prefix) = prefix {
+            net_info!(
+                "IPv6 PIO received: {}/{} via {} valid {}s preferred {}s",
+                prefix.prefix,
+                prefix.prefix_len,
+                source,
+                prefix.valid_lifetime.secs(),
+                prefix.preferred_lifetime.secs()
+            );
+            if prefix.is_valid_prefix_info() {
+                self.process_prefix(prefix, now)
+            }
         }
 
         if router_lifetime > Duration::ZERO {
