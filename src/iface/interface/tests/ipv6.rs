@@ -963,6 +963,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
         lladdr: None,
         mtu: None,
         prefix_info: Some(prefix_information),
+        #[cfg(feature = "proto-ipv6-rio")]
         route_info: None,
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
@@ -1110,7 +1111,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
 
 #[rstest]
 #[case(Medium::Ethernet)]
-#[cfg(feature = "proto-ipv6-slaac")]
+#[cfg(feature = "proto-ipv6-rio")]
 fn test_router_advertisement_route_info(#[case] medium: Medium) {
     // Prefix of a Thread mesh network advertised by a Thread Border Router
     // through a Route Information Option (RFC 4191).
@@ -1132,11 +1133,7 @@ fn test_router_advertisement_route_info(#[case] medium: Medium) {
         Ipv6Cidr::from_link_prefix(&ll_prefix, HardwareAddress::Ethernet(remote_hw_addr)).unwrap();
 
     // Create config with slaac enabled
-    let mut config = Config::new(match medium {
-        #[cfg(feature = "medium-ethernet")]
-        Medium::Ethernet => HardwareAddress::Ethernet(local_hw_addr),
-        _ => panic!("Not supported"),
-    });
+    let mut config = Config::new(HardwareAddress::Ethernet(local_hw_addr));
     config.slaac = true;
 
     // Set up interface with link local address

@@ -516,6 +516,7 @@ impl InterfaceInner {
                 lladdr: _,
                 mtu: _,
                 prefix_info,
+                #[cfg(feature = "proto-ipv6-rio")]
                 route_info,
             } if self.slaac_enabled => {
                 if ip_repr.src_addr.is_link_local()
@@ -527,6 +528,7 @@ impl InterfaceInner {
                         &ip_repr.src_addr,
                         router_lifetime,
                         prefix_info,
+                        #[cfg(feature = "proto-ipv6-rio")]
                         route_info,
                         self.now,
                     )

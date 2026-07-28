@@ -4,9 +4,9 @@ use heapless::{LinearMap, Vec};
 use crate::config::{IFACE_MAX_PREFIX_COUNT, IFACE_MAX_ROUTE_COUNT};
 use crate::time::{Duration, Instant};
 use crate::wire::NdiscPrefixInfoFlags;
-use crate::wire::{
-    Ipv6Address, Ipv6Cidr, NdiscPrefixInformation, NdiscRouteInformation, ipv6::AddressExt,
-};
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::wire::NdiscRouteInformation;
+use crate::wire::{Ipv6Address, Ipv6Cidr, NdiscPrefixInformation, ipv6::AddressExt};
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
 const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
@@ -186,9 +186,9 @@ impl Slaac {
     pub(super) fn process_advertisement(
         &mut self,
         source: &Ipv6Address,
-        router_lifetime: Duration,                 // default route lifetime
-        prefix: Option<NdiscPrefixInformation>,    // prefix info
-        route_info: Option<NdiscRouteInformation>, // route info
+        router_lifetime: Duration,              // default route lifetime
+        prefix: Option<NdiscPrefixInformation>, // prefix info
+        #[cfg(feature = "proto-ipv6-rio")] route_info: Option<NdiscRouteInformation>, // route info
         now: Instant,
     ) {
         if let Some(prefix) = prefix
@@ -197,6 +197,7 @@ impl Slaac {
             self.process_prefix(prefix, now)
         }
 
+        #[cfg(feature = "proto-ipv6-rio")]
         if let Some(route_info) = route_info
             && route_info.is_valid_route_info()
         {
@@ -332,6 +333,7 @@ mod test {
             valid_until: Instant::from_millis_const(100000),
         };
 
+        #[cfg(feature = "proto-ipv6-rio")]
         pub const ROUTE_INFO: NdiscRouteInformation = NdiscRouteInformation {
             prefix_len: 64,
             preference: crate::wire::NdiscRoutePreference::High,
@@ -390,7 +392,14 @@ mod test {
         assert!(!slaac.has_ra_update());
 
         // Unsolicited advertisement
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
+        slaac.process_advertisement(
+            &SOURCE,
+            VALID,
+            Some(PREFIX),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
         assert_eq!(slaac.phase, Phase::Start);
         assert!(slaac.has_ra_update());
 
@@ -399,8 +408,22 @@ mod test {
         assert_eq!(slaac.phase, Phase::Discovering);
 
         // Solicited advertisement
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
+        slaac.process_advertisement(
+            &SOURCE,
+            VALID,
+            Some(PREFIX),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
+        slaac.process_advertisement(
+            &SOURCE,
+            VALID,
+            Some(PREFIX),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
         assert_eq!(slaac.phase, Phase::Maintaining);
         let poll_at = slaac.poll_at(now).unwrap();
         assert_eq!(poll_at, now + VALID);
@@ -463,7 +486,14 @@ mod test {
         let mut slaac = Slaac::new();
         let now = Instant::from_millis(1);
         slaac.rs_sent(now);
-        slaac.process_advertisement(&SOURCE, VALID, Some(PREFIX), None, now);
+        slaac.process_advertisement(
+            &SOURCE,
+            VALID,
+            Some(PREFIX),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
 
         let now = Instant::from_secs(300);
 
@@ -481,7 +511,14 @@ mod test {
         expire_prefix.valid_lifetime = Duration::ZERO;
 
         // Invalidate the prefix, but not the route
-        slaac.process_advertisement(&SOURCE, VALID, Some(expire_prefix), None, now);
+        slaac.process_advertisement(
+            &SOURCE,
+            VALID,
+            Some(expire_prefix),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
 
         assert!(slaac.sync_required(now));
         for (_prefix, info) in slaac.prefix() {
@@ -496,7 +533,14 @@ mod test {
 
         assert!(!slaac.sync_required(now));
         // Invalidate also the route
-        slaac.process_advertisement(&SOURCE, Duration::ZERO, Some(expire_prefix), None, now);
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            Some(expire_prefix),
+            #[cfg(feature = "proto-ipv6-rio")]
+            None,
+            now,
+        );
         assert!(slaac.sync_required(now));
         for route in slaac.routes() {
             assert!(!route.is_valid(now));
@@ -512,6 +556,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_ra_route_info() {
         let mut slaac = Slaac::new();
         let now = Instant::from_millis(1);
@@ -552,6 +597,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_ra_route_info_reserved_preference() {
         let mut slaac = Slaac::new();
         let now = Instant::from_millis(1);

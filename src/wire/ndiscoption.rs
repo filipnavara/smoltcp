@@ -48,6 +48,7 @@ bitflags! {
     }
 }
 
+#[cfg(feature = "proto-ipv6-rio")]
 enum_with_unknown! {
     /// Route preference of a Route Information option.
     /// See [RFC 4191 § 2.2].
@@ -63,6 +64,7 @@ enum_with_unknown! {
     }
 }
 
+#[cfg(feature = "proto-ipv6-rio")]
 impl fmt::Display for RoutePreference {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -181,13 +183,17 @@ mod field {
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
     // Prefix length.
+    #[cfg(feature = "proto-ipv6-rio")]
     pub const ROUTE_PREFIX_LEN: usize = 2;
     // Flags field of route information header.
+    #[cfg(feature = "proto-ipv6-rio")]
     pub const ROUTE_FLAGS: usize = 3;
     // Route lifetime.
+    #[cfg(feature = "proto-ipv6-rio")]
     pub const ROUTE_LT: Field = 4..8;
     // Start of the variable-length prefix (0, 8 or 16 octets depending
     // on the option length).
+    #[cfg(feature = "proto-ipv6-rio")]
     pub const ROUTE_PREFIX: usize = 8;
 }
 
@@ -237,6 +243,7 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
                     // The option length determines the size of the prefix field
                     // and must be 1, 2 or 3.
+                    #[cfg(feature = "proto-ipv6-rio")]
                     Type::RouteInformation if matches!(data[field::LENGTH], 1..=3) => Ok(()),
                     Type::Unknown(_) => Ok(()),
                     _ => Err(Error),
@@ -323,6 +330,7 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
 }
 
 /// Getter methods only relevant for the Route Information option.
+#[cfg(feature = "proto-ipv6-rio")]
 impl<T: AsRef<[u8]>> NdiscOption<T> {
     /// Return the route prefix length.
     #[inline]
@@ -460,6 +468,7 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> NdiscOption<T> {
 }
 
 /// Setter methods only relevant for the Route Information option.
+#[cfg(feature = "proto-ipv6-rio")]
 impl<T: AsRef<[u8]> + AsMut<[u8]>> NdiscOption<T> {
     /// Set the route prefix length.
     #[inline]
@@ -559,6 +568,7 @@ pub struct RedirectedHeader<'a> {
 /// See [RFC 4191 § 2.2].
 ///
 /// [RFC 4191 § 2.2]: https://www.rfc-editor.org/rfc/rfc4191#section-2.2
+#[cfg(feature = "proto-ipv6-rio")]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RouteInformation {
@@ -568,6 +578,7 @@ pub struct RouteInformation {
     pub prefix: Ipv6Address,
 }
 
+#[cfg(feature = "proto-ipv6-rio")]
 impl RouteInformation {
     /// Validates the route information option.
     ///
@@ -589,6 +600,7 @@ pub enum Repr<'a> {
     PrefixInformation(PrefixInformation),
     RedirectedHeader(RedirectedHeader<'a>),
     Mtu(u32),
+    #[cfg(feature = "proto-ipv6-rio")]
     RouteInformation(RouteInformation),
     Unknown {
         type_: u8,
@@ -658,6 +670,7 @@ impl<'a> Repr<'a> {
                     Err(Error)
                 }
             }
+            #[cfg(feature = "proto-ipv6-rio")]
             Type::RouteInformation => {
                 // The prefix field holds 0, 8 or 16 octets depending on the
                 // option length, and the prefix length must fit in it.
@@ -670,6 +683,20 @@ impl<'a> Repr<'a> {
                         route_lifetime: opt.route_lifetime(),
                         prefix: opt.route_prefix(),
                     }))
+                } else {
+                    Err(Error)
+                }
+            }
+            #[cfg(not(feature = "proto-ipv6-rio"))]
+            Type::RouteInformation => {
+                // Without Route Information Option support, treat the option
+                // as unknown.
+                if opt.data_len() != 0 {
+                    Ok(Repr::Unknown {
+                        type_: u8::from(Type::RouteInformation),
+                        length: opt.data_len(),
+                        data: opt.data(),
+                    })
                 } else {
                     Err(Error)
                 }
@@ -702,6 +729,7 @@ impl<'a> Repr<'a> {
                 (8 + header.buffer_len() + data.len()).div_ceil(8) * 8
             }
             &Repr::Mtu(_) => field::MTU.end,
+            #[cfg(feature = "proto-ipv6-rio")]
             &Repr::RouteInformation(RouteInformation { prefix_len, .. }) => {
                 field::ROUTE_PREFIX
                     + if prefix_len == 0 {
@@ -766,6 +794,7 @@ impl<'a> Repr<'a> {
                 opt.set_data_len(1);
                 opt.set_mtu(mtu);
             }
+            #[cfg(feature = "proto-ipv6-rio")]
             Repr::RouteInformation(RouteInformation {
                 prefix_len,
                 preference,
@@ -820,6 +849,7 @@ impl<'a> fmt::Display for Repr<'a> {
             Repr::Mtu(mtu) => {
                 write!(f, "MTU mtu={mtu}")
             }
+            #[cfg(feature = "proto-ipv6-rio")]
             Repr::RouteInformation(RouteInformation {
                 prefix, prefix_len, ..
             }) => {
@@ -858,10 +888,9 @@ impl<T: AsRef<[u8]>> PrettyPrint for NdiscOption<T> {
 #[cfg(test)]
 mod test {
     use super::Error;
-    use super::{
-        NdiscOption, PrefixInfoFlags, PrefixInformation, Repr, RouteInformation, RoutePreference,
-        Type,
-    };
+    use super::{NdiscOption, PrefixInfoFlags, PrefixInformation, Repr, Type};
+    #[cfg(feature = "proto-ipv6-rio")]
+    use super::{RouteInformation, RoutePreference};
     use crate::time::Duration;
     use crate::wire::Ipv6Address;
 
@@ -996,6 +1025,7 @@ mod test {
 
     // Route Information option: prefix 2001:db8::ff00/120, high preference,
     // lifetime 1800 s.
+    #[cfg(feature = "proto-ipv6-rio")]
     static ROUTE_INFO_OPT_BYTES: [u8; 24] = [
         0x18, 0x03, 0x78, 0x08, 0x00, 0x00, 0x07, 0x08, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00,
@@ -1003,12 +1033,14 @@ mod test {
 
     // Route Information option with an 8-octet prefix field:
     // prefix 2001:db8:ffff::/48, medium preference, infinite lifetime.
+    #[cfg(feature = "proto-ipv6-rio")]
     static ROUTE_INFO_OPT_SHORT_BYTES: [u8; 16] = [
         0x18, 0x02, 0x30, 0x00, 0xff, 0xff, 0xff, 0xff, 0x20, 0x01, 0x0d, 0xb8, 0xff, 0xff, 0x00,
         0x00,
     ];
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_route_info_deconstruct() {
         let opt = NdiscOption::new_unchecked(&ROUTE_INFO_OPT_BYTES[..]);
         assert_eq!(opt.option_type(), Type::RouteInformation);
@@ -1034,6 +1066,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_route_info_construct() {
         let mut bytes = [0x00; 24];
         let mut opt = NdiscOption::new_unchecked(&mut bytes[..]);
@@ -1057,6 +1090,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_repr_parse_route_info() {
         let repr = Repr::RouteInformation(RouteInformation {
             prefix_len: 120,
@@ -1107,6 +1141,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_repr_emit_route_info() {
         let mut bytes = [0x2a; 24];
         let repr = Repr::RouteInformation(RouteInformation {
@@ -1132,6 +1167,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_route_info_validity() {
         let valid = RouteInformation {
             prefix_len: 64,

@@ -261,8 +261,15 @@ pub use self::ndisc::{
 pub use self::ndiscoption::{
     NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags,
     PrefixInformation as NdiscPrefixInformation, RedirectedHeader as NdiscRedirectedHeader,
-    Repr as NdiscOptionRepr, RouteInformation as NdiscRouteInformation,
-    RoutePreference as NdiscRoutePreference, Type as NdiscOptionType,
+    Repr as NdiscOptionRepr, Type as NdiscOptionType,
+};
+
+#[cfg(all(
+    feature = "proto-ipv6-rio",
+    any(feature = "medium-ethernet", feature = "medium-ieee802154")
+))]
+pub use self::ndiscoption::{
+    RouteInformation as NdiscRouteInformation, RoutePreference as NdiscRoutePreference,
 };
 
 #[cfg(feature = "proto-ipv6")]

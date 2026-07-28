@@ -4,10 +4,12 @@ use byteorder::{ByteOrder, NetworkEndian};
 use super::{Error, Result};
 use crate::time::Duration;
 use crate::wire::Ipv6Address;
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::wire::NdiscRouteInformation;
 use crate::wire::RawHardwareAddress;
 use crate::wire::icmpv6::{Message, Packet, field};
 use crate::wire::{NdiscOption, NdiscOptionRepr};
-use crate::wire::{NdiscPrefixInformation, NdiscRedirectedHeader, NdiscRouteInformation};
+use crate::wire::{NdiscPrefixInformation, NdiscRedirectedHeader};
 
 bitflags! {
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -204,6 +206,7 @@ pub enum Repr<'a> {
         lladdr: Option<RawHardwareAddress>,
         mtu: Option<u32>,
         prefix_info: Option<NdiscPrefixInformation>,
+        #[cfg(feature = "proto-ipv6-rio")]
         route_info: Option<NdiscRouteInformation>,
     },
     NeighborSolicit {
@@ -233,14 +236,10 @@ impl<'a> Repr<'a> {
     {
         packet.check_len()?;
 
-        let (
-            mut src_ll_addr,
-            mut mtu,
-            mut prefix_info,
-            mut target_ll_addr,
-            mut redirected_hdr,
-            mut route_info,
-        ) = (None, None, None, None, None, None);
+        let (mut src_ll_addr, mut mtu, mut prefix_info, mut target_ll_addr, mut redirected_hdr) =
+            (None, None, None, None, None);
+        #[cfg(feature = "proto-ipv6-rio")]
+        let mut route_info = None;
 
         let mut offset = 0;
         while packet.payload().len() > offset {
@@ -254,6 +253,7 @@ impl<'a> Repr<'a> {
                     NdiscOptionRepr::PrefixInformation(prefix) => prefix_info = Some(prefix),
                     NdiscOptionRepr::RedirectedHeader(redirect) => redirected_hdr = Some(redirect),
                     NdiscOptionRepr::Mtu(m) => mtu = Some(m),
+                    #[cfg(feature = "proto-ipv6-rio")]
                     NdiscOptionRepr::RouteInformation(info) => route_info = Some(info),
                     _ => {}
                 }
@@ -279,6 +279,7 @@ impl<'a> Repr<'a> {
                 lladdr: src_ll_addr,
                 mtu,
                 prefix_info,
+                #[cfg(feature = "proto-ipv6-rio")]
                 route_info,
             }),
             Message::NeighborSolicit => Ok(Repr::NeighborSolicit {
@@ -312,6 +313,7 @@ impl<'a> Repr<'a> {
                 lladdr,
                 mtu,
                 prefix_info,
+                #[cfg(feature = "proto-ipv6-rio")]
                 route_info,
                 ..
             } => {
@@ -325,6 +327,7 @@ impl<'a> Repr<'a> {
                 if let Some(prefix_info) = prefix_info {
                     offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
                 }
+                #[cfg(feature = "proto-ipv6-rio")]
                 if let Some(route_info) = route_info {
                     offset += NdiscOptionRepr::RouteInformation(route_info).buffer_len();
                 }
@@ -380,6 +383,7 @@ impl<'a> Repr<'a> {
                 lladdr,
                 mtu,
                 prefix_info,
+                #[cfg(feature = "proto-ipv6-rio")]
                 route_info,
             } => {
                 packet.set_msg_type(Message::RouterAdvert);
@@ -406,8 +410,12 @@ impl<'a> Repr<'a> {
                     let mut opt_pkt =
                         NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..]);
                     NdiscOptionRepr::PrefixInformation(prefix_info).emit(&mut opt_pkt);
-                    offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
+                    #[cfg(feature = "proto-ipv6-rio")]
+                    {
+                        offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
+                    }
                 }
+                #[cfg(feature = "proto-ipv6-rio")]
                 if let Some(route_info) = route_info {
                     let mut opt_pkt =
                         NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..]);
@@ -501,6 +509,7 @@ mod test {
             lladdr: Some(EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]).into()),
             mtu: None,
             prefix_info: None,
+            #[cfg(feature = "proto-ipv6-rio")]
             route_info: None,
         })
     }
