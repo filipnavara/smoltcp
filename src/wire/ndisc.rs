@@ -7,7 +7,7 @@ use crate::wire::Ipv6Address;
 use crate::wire::RawHardwareAddress;
 use crate::wire::icmpv6::{Message, Packet, field};
 use crate::wire::{NdiscOption, NdiscOptionRepr};
-use crate::wire::{NdiscPrefixInformation, NdiscRedirectedHeader};
+use crate::wire::{NdiscPrefixInformation, NdiscRedirectedHeader, NdiscRouteInformation};
 
 bitflags! {
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -204,6 +204,7 @@ pub enum Repr<'a> {
         lladdr: Option<RawHardwareAddress>,
         mtu: Option<u32>,
         prefix_info: Option<NdiscPrefixInformation>,
+        route_info: Option<NdiscRouteInformation>,
     },
     NeighborSolicit {
         target_addr: Ipv6Address,
@@ -232,8 +233,14 @@ impl<'a> Repr<'a> {
     {
         packet.check_len()?;
 
-        let (mut src_ll_addr, mut mtu, mut prefix_info, mut target_ll_addr, mut redirected_hdr) =
-            (None, None, None, None, None);
+        let (
+            mut src_ll_addr,
+            mut mtu,
+            mut prefix_info,
+            mut target_ll_addr,
+            mut redirected_hdr,
+            mut route_info,
+        ) = (None, None, None, None, None, None);
 
         let mut offset = 0;
         while packet.payload().len() > offset {
@@ -247,6 +254,7 @@ impl<'a> Repr<'a> {
                     NdiscOptionRepr::PrefixInformation(prefix) => prefix_info = Some(prefix),
                     NdiscOptionRepr::RedirectedHeader(redirect) => redirected_hdr = Some(redirect),
                     NdiscOptionRepr::Mtu(m) => mtu = Some(m),
+                    NdiscOptionRepr::RouteInformation(info) => route_info = Some(info),
                     _ => {}
                 }
             }
@@ -271,6 +279,7 @@ impl<'a> Repr<'a> {
                 lladdr: src_ll_addr,
                 mtu,
                 prefix_info,
+                route_info,
             }),
             Message::NeighborSolicit => Ok(Repr::NeighborSolicit {
                 target_addr: packet.target_addr(),
@@ -303,6 +312,7 @@ impl<'a> Repr<'a> {
                 lladdr,
                 mtu,
                 prefix_info,
+                route_info,
                 ..
             } => {
                 let mut offset = 0;
@@ -314,6 +324,9 @@ impl<'a> Repr<'a> {
                 }
                 if let Some(prefix_info) = prefix_info {
                     offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
+                }
+                if let Some(route_info) = route_info {
+                    offset += NdiscOptionRepr::RouteInformation(route_info).buffer_len();
                 }
                 field::RETRANS_TM.end + offset
             }
@@ -367,6 +380,7 @@ impl<'a> Repr<'a> {
                 lladdr,
                 mtu,
                 prefix_info,
+                route_info,
             } => {
                 packet.set_msg_type(Message::RouterAdvert);
                 packet.set_msg_code(0);
@@ -391,7 +405,13 @@ impl<'a> Repr<'a> {
                 if let Some(prefix_info) = prefix_info {
                     let mut opt_pkt =
                         NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..]);
-                    NdiscOptionRepr::PrefixInformation(prefix_info).emit(&mut opt_pkt)
+                    NdiscOptionRepr::PrefixInformation(prefix_info).emit(&mut opt_pkt);
+                    offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
+                }
+                if let Some(route_info) = route_info {
+                    let mut opt_pkt =
+                        NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..]);
+                    NdiscOptionRepr::RouteInformation(route_info).emit(&mut opt_pkt)
                 }
             }
 
@@ -481,6 +501,7 @@ mod test {
             lladdr: Some(EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]).into()),
             mtu: None,
             prefix_info: None,
+            route_info: None,
         })
     }
 

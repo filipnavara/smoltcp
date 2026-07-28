@@ -899,6 +899,11 @@ fn test_router_advertisement(#[case] medium: Medium) {
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs.push(IpCidr::Ipv6(local_ip_addr)).unwrap();
     });
+    #[cfg(feature = "proto-ipv4")]
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 0, 2, 1))
+        .unwrap();
 
     let mut sockets = SocketSet::new(vec![]);
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
@@ -958,6 +963,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
         lladdr: None,
         mtu: None,
         prefix_info: Some(prefix_information),
+        route_info: None,
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),
@@ -986,6 +992,18 @@ fn test_router_advertisement(#[case] medium: Medium) {
     );
 
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
+
+    // An unrelated IPv4 route must not prevent synchronization of an IPv6
+    // route learned from a Router Advertisement.
+    #[cfg(feature = "proto-ipv4")]
+    iface.routes_mut().update(|routes| {
+        assert!(routes.iter().any(|route| {
+            route.cidr == IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0)
+                && route.via_router == IpAddress::Ipv6(remote_ip_addr.address())
+        }));
+    });
+    #[cfg(feature = "proto-ipv4")]
+    iface.routes_mut().remove_default_ipv4_route();
 
     // Expect to have these two addresses after the router advertisement
     let expected_addrs = [
@@ -1087,6 +1105,145 @@ fn test_router_advertisement(#[case] medium: Medium) {
     iface.poll(now, &mut device, &mut sockets);
     iface.routes_mut().update(|route| {
         assert_eq!(route.len(), 0);
+    });
+}
+
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "proto-ipv6-slaac")]
+fn test_router_advertisement_route_info(#[case] medium: Medium) {
+    // Prefix of a Thread mesh network advertised by a Thread Border Router
+    // through a Route Information Option (RFC 4191).
+    let thread_prefix = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 0);
+    let thread_cidr = IpCidr::new(IpAddress::Ipv6(thread_prefix), 64);
+
+    let mut device = crate::tests::TestingDevice::new(medium);
+
+    // Ethernet header + IPv6 header + router advertisement header + RIO
+    let mut eth_bytes = vec![0u8; 14 + 40 + 16 + 16];
+
+    // Create mac addresses with derived link local addresses
+    let local_hw_addr = EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]);
+    let remote_hw_addr = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
+    let ll_prefix = Ipv6Cidr::new(Ipv6Cidr::LINK_LOCAL_PREFIX.address(), 64);
+    let local_ip_addr =
+        Ipv6Cidr::from_link_prefix(&ll_prefix, HardwareAddress::Ethernet(local_hw_addr)).unwrap();
+    let remote_ip_addr =
+        Ipv6Cidr::from_link_prefix(&ll_prefix, HardwareAddress::Ethernet(remote_hw_addr)).unwrap();
+
+    // Create config with slaac enabled
+    let mut config = Config::new(match medium {
+        #[cfg(feature = "medium-ethernet")]
+        Medium::Ethernet => HardwareAddress::Ethernet(local_hw_addr),
+        _ => panic!("Not supported"),
+    });
+    config.slaac = true;
+
+    // Set up interface with link local address
+    let mut iface = Interface::new(config, &mut device, Instant::ZERO);
+    iface.update_ip_addrs(|ip_addrs| {
+        ip_addrs.push(IpCidr::Ipv6(local_ip_addr)).unwrap();
+    });
+
+    let mut sockets = SocketSet::new(vec![]);
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+
+    // Craft a router advertisement carrying a route information option
+    let route_information = NdiscRouteInformation {
+        prefix_len: 64,
+        preference: NdiscRoutePreference::High,
+        route_lifetime: Duration::from_secs(1800),
+        prefix: thread_prefix,
+    };
+    let mut advertisement = NdiscRepr::RouterAdvert {
+        hop_limit: 255,
+        flags: NdiscRouterFlags::empty(),
+        router_lifetime: Duration::from_secs(600),
+        reachable_time: Duration::from_secs(0),
+        retrans_time: Duration::from_secs(0),
+        lladdr: None,
+        mtu: None,
+        prefix_info: None,
+        route_info: Some(route_information),
+    };
+    let ip_repr = IpRepr::Ipv6(Ipv6Repr {
+        src_addr: remote_ip_addr.address(),
+        dst_addr: local_ip_addr.address(),
+        next_header: IpProtocol::Icmpv6,
+        hop_limit: 255,
+        payload_len: advertisement.buffer_len(),
+    });
+    let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+    frame.set_dst_addr(local_hw_addr);
+    frame.set_src_addr(remote_hw_addr);
+    frame.set_ethertype(EthernetProtocol::Ipv6);
+    ip_repr.emit(frame.payload_mut(), &ChecksumCapabilities::default());
+    Icmpv6Repr::Ndisc(advertisement).emit(
+        &remote_ip_addr.address(),
+        &local_ip_addr.address(),
+        &mut Icmpv6Packet::new_unchecked(&mut frame.payload_mut()[ip_repr.header_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+
+    iface.inner.process_ethernet(
+        &mut sockets,
+        PacketMeta::default(),
+        frame.into_inner(),
+        &mut iface.fragments,
+    );
+
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+
+    // Both the default route and the RIO-learned route to the Thread prefix
+    // must be installed via the advertising router.
+    iface.routes_mut().update(|routes| {
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|route| {
+            route.cidr == thread_cidr
+                && route.via_router == IpAddress::Ipv6(remote_ip_addr.address())
+        }));
+        assert!(routes.iter().any(|route| {
+            route.cidr == IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0)
+                && route.via_router == IpAddress::Ipv6(remote_ip_addr.address())
+        }));
+    });
+
+    // Craft a router advertisement with zero route lifetime to remove the
+    // RIO-learned route, but retain the default route
+    if let NdiscRepr::RouterAdvert {
+        ref mut route_info, ..
+    } = advertisement
+    {
+        let mut expired = route_information;
+        expired.route_lifetime = Duration::ZERO;
+        *route_info = Some(expired);
+    }
+
+    let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+    frame.set_dst_addr(local_hw_addr);
+    frame.set_src_addr(remote_hw_addr);
+    frame.set_ethertype(EthernetProtocol::Ipv6);
+    ip_repr.emit(frame.payload_mut(), &ChecksumCapabilities::default());
+    Icmpv6Repr::Ndisc(advertisement).emit(
+        &remote_ip_addr.address(),
+        &local_ip_addr.address(),
+        &mut Icmpv6Packet::new_unchecked(&mut frame.payload_mut()[ip_repr.header_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+
+    iface.inner.process_ethernet(
+        &mut sockets,
+        PacketMeta::default(),
+        frame.into_inner(),
+        &mut iface.fragments,
+    );
+
+    let now = Instant::from_secs(10);
+    iface.poll(now, &mut device, &mut sockets);
+
+    iface.routes_mut().update(|routes| {
+        assert_eq!(routes.len(), 1);
+        assert!(!routes.iter().any(|route| route.cidr == thread_cidr));
     });
 }
 

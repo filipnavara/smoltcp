@@ -516,6 +516,7 @@ impl InterfaceInner {
                 lladdr: _,
                 mtu: _,
                 prefix_info,
+                route_info,
             } if self.slaac_enabled => {
                 if ip_repr.src_addr.is_link_local()
                     && (ip_repr.dst_addr == IPV6_LINK_LOCAL_ALL_NODES
@@ -526,6 +527,7 @@ impl InterfaceInner {
                         &ip_repr.src_addr,
                         router_lifetime,
                         prefix_info,
+                        route_info,
                         self.now,
                     )
                 }
@@ -685,7 +687,8 @@ impl Interface {
                         (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
                             !route.same_route(cidr, via_router)
                         }
-                        _ => false,
+                        // Routes from another address family cannot conflict.
+                        _ => true,
                     }) {
                         let _ = routes.push(Route {
                             cidr: route.cidr.into(),
