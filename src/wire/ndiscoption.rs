@@ -4,25 +4,60 @@ use core::fmt;
 
 use super::{Error, Result};
 use crate::time::Duration;
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::wire::Ipv6Cidr;
 use crate::wire::{Ipv6Address, Ipv6AddressExt, Ipv6Packet, Ipv6Repr, MAX_HARDWARE_ADDRESS_LEN};
 
 use crate::wire::RawHardwareAddress;
 
-enum_with_unknown! {
-    /// NDISC Option Type
-    pub enum Type(u8) {
-        /// Source Link-layer Address
-        SourceLinkLayerAddr = 0x1,
-        /// Target Link-layer Address
-        TargetLinkLayerAddr = 0x2,
-        /// Prefix Information
-        PrefixInformation   = 0x3,
-        /// Redirected Header
-        RedirectedHeader    = 0x4,
-        /// MTU
-        Mtu                 = 0x5,
-        /// Route Information
-        RouteInformation    = 0x18
+/// NDISC Option Type.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Type {
+    /// Source Link-layer Address
+    SourceLinkLayerAddr,
+    /// Target Link-layer Address
+    TargetLinkLayerAddr,
+    /// Prefix Information
+    PrefixInformation,
+    /// Redirected Header
+    RedirectedHeader,
+    /// MTU
+    Mtu,
+    /// Route Information
+    #[cfg(feature = "proto-ipv6-rio")]
+    RouteInformation,
+    /// An option type not supported by the enabled feature set.
+    Unknown(u8),
+}
+
+impl From<u8> for Type {
+    fn from(value: u8) -> Self {
+        match value {
+            0x1 => Self::SourceLinkLayerAddr,
+            0x2 => Self::TargetLinkLayerAddr,
+            0x3 => Self::PrefixInformation,
+            0x4 => Self::RedirectedHeader,
+            0x5 => Self::Mtu,
+            #[cfg(feature = "proto-ipv6-rio")]
+            0x18 => Self::RouteInformation,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl From<Type> for u8 {
+    fn from(value: Type) -> Self {
+        match value {
+            Type::SourceLinkLayerAddr => 0x1,
+            Type::TargetLinkLayerAddr => 0x2,
+            Type::PrefixInformation => 0x3,
+            Type::RedirectedHeader => 0x4,
+            Type::Mtu => 0x5,
+            #[cfg(feature = "proto-ipv6-rio")]
+            Type::RouteInformation => 0x18,
+            Type::Unknown(other) => other,
+        }
     }
 }
 
@@ -34,6 +69,7 @@ impl fmt::Display for Type {
             Type::PrefixInformation => write!(f, "prefix information"),
             Type::RedirectedHeader => write!(f, "redirected header"),
             Type::Mtu => write!(f, "mtu"),
+            #[cfg(feature = "proto-ipv6-rio")]
             Type::RouteInformation => write!(f, "route information"),
             Type::Unknown(id) => write!(f, "{id}"),
         }
@@ -51,9 +87,9 @@ bitflags! {
 #[cfg(feature = "proto-ipv6-rio")]
 enum_with_unknown! {
     /// Route preference of a Route Information option.
-    /// See [RFC 4191 § 2.2].
+    /// See [RFC 4191 § 2.1].
     ///
-    /// [RFC 4191 § 2.2]: https://www.rfc-editor.org/rfc/rfc4191#section-2.2
+    /// [RFC 4191 § 2.1]: https://www.rfc-editor.org/rfc/rfc4191#section-2.1
     pub enum RoutePreference(u8) {
         /// Medium (default) route preference.
         Medium = 0,
@@ -72,6 +108,32 @@ impl fmt::Display for RoutePreference {
             RoutePreference::High => write!(f, "high"),
             RoutePreference::Low => write!(f, "low"),
             RoutePreference::Unknown(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl RoutePreference {
+    /// Return whether this is one of the three preference values defined by
+    /// RFC 4191.
+    pub const fn is_valid(self) -> bool {
+        matches!(self, Self::Medium | Self::High | Self::Low)
+    }
+
+    /// Apply the RA-header rule that maps the reserved value to Medium.
+    pub(crate) const fn normalized_for_router_header(self) -> Self {
+        match self {
+            Self::Medium | Self::High | Self::Low => self,
+            Self::Unknown(_) => Self::Medium,
+        }
+    }
+
+    pub(crate) const fn rank(self) -> i8 {
+        match self {
+            Self::Low => -1,
+            Self::Medium => 0,
+            Self::High => 1,
+            Self::Unknown(_) => -2,
         }
     }
 }
@@ -172,7 +234,7 @@ mod field {
     //  MTU
     pub const MTU: Field = 4..8;
 
-    // Route Information Option fields (RFC 4191 § 2.2).
+    // Route Information Option fields (RFC 4191 § 2.3).
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     //  |     Type      |    Length     | Prefix Length |Resvd|Prf|Resvd|
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -211,12 +273,6 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     pub fn new_checked(buffer: T) -> Result<NdiscOption<T>> {
         let opt = Self::new_unchecked(buffer);
         opt.check_len()?;
-
-        // A data length field of 0 is invalid.
-        if opt.data_len() == 0 {
-            return Err(Error);
-        }
-
         Ok(opt)
     }
 
@@ -230,7 +286,9 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
         let data = self.buffer.as_ref();
         let len = data.len();
 
-        if len < field::MIN_OPT_LEN {
+        if len < field::MIN_OPT_LEN || data[field::LENGTH] == 0 {
+            // A zero-length option cannot be skipped by an RA parser and
+            // creates invalid accessor ranges, so reject it structurally.
             Err(Error)
         } else {
             let data_range = field::DATA(data[field::LENGTH]);
@@ -241,11 +299,10 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                     Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
-                    // The option length determines the size of the prefix field
-                    // and must be 1, 2 or 3.
+                    // Keep semantic RIO validation in Repr::parse. This lets
+                    // an RA ignore one malformed, nonzero-length RIO while
+                    // continuing with its other independently parsed options.
                     #[cfg(feature = "proto-ipv6-rio")]
-                    Type::RouteInformation if matches!(data[field::LENGTH], 1..=3) => Ok(()),
-                    #[cfg(not(feature = "proto-ipv6-rio"))]
                     Type::RouteInformation => Ok(()),
                     Type::Unknown(_) => Ok(()),
                     _ => Err(Error),
@@ -347,6 +404,9 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     }
 
     /// Return the route lifetime.
+    ///
+    /// The all-ones wire value is returned as
+    /// [`RouteInformation::INFINITE_LIFETIME`].
     #[inline]
     pub fn route_lifetime(&self) -> Duration {
         let data = self.buffer.as_ref();
@@ -361,7 +421,12 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     #[inline]
     pub fn route_prefix(&self) -> Ipv6Address {
         let data = self.buffer.as_ref();
-        let prefix_bytes = self.data_len() as usize * 8 - field::ROUTE_PREFIX;
+        // Structural checking intentionally accepts nonzero malformed RIO
+        // lengths so an RA can skip them. Clamp here to preserve check_len's
+        // guarantee that accessors remain safe for those checked options.
+        let prefix_bytes = (self.data_len() as usize * 8)
+            .saturating_sub(field::ROUTE_PREFIX)
+            .min(16);
         let mut octets = [0u8; 16];
         octets[..prefix_bytes]
             .copy_from_slice(&data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_bytes]);
@@ -481,17 +546,21 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> NdiscOption<T> {
     /// Set the route preference.
     ///
     /// The reserved bits of the flags field are cleared, as required by
-    /// RFC 4191 § 2.2.
+    /// RFC 4191 § 2.3.
     #[inline]
     pub fn set_route_preference(&mut self, pref: RoutePreference) {
-        self.buffer.as_mut()[field::ROUTE_FLAGS] = u8::from(pref) << 3;
+        self.buffer.as_mut()[field::ROUTE_FLAGS] = (u8::from(pref) & 0b11) << 3;
     }
 
     /// Set the route lifetime.
+    ///
+    /// Values at or above [`RouteInformation::INFINITE_LIFETIME`] are
+    /// saturated to the all-ones wire value.
     #[inline]
     pub fn set_route_lifetime(&mut self, time: Duration) {
         let data = self.buffer.as_mut();
-        NetworkEndian::write_u32(&mut data[field::ROUTE_LT], time.secs() as u32);
+        let seconds = time.secs().min(u32::MAX as u64) as u32;
+        NetworkEndian::write_u32(&mut data[field::ROUTE_LT], seconds);
     }
 
     /// Set the route prefix.
@@ -501,7 +570,9 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> NdiscOption<T> {
     #[inline]
     pub fn set_route_prefix(&mut self, addr: Ipv6Address) {
         let data = self.buffer.as_mut();
-        let prefix_bytes = data[field::LENGTH] as usize * 8 - field::ROUTE_PREFIX;
+        let prefix_bytes = (data[field::LENGTH] as usize * 8)
+            .saturating_sub(field::ROUTE_PREFIX)
+            .min(16);
         let prefix_len = usize::from(data[field::ROUTE_PREFIX_LEN]).min(prefix_bytes * 8);
         let prefix = &mut data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_bytes];
         prefix.copy_from_slice(&addr.octets()[..prefix_bytes]);
@@ -576,9 +647,9 @@ pub struct RedirectedHeader<'a> {
 }
 
 /// A high-level representation of a Route Information option.
-/// See [RFC 4191 § 2.2].
+/// See [RFC 4191 § 2.3].
 ///
-/// [RFC 4191 § 2.2]: https://www.rfc-editor.org/rfc/rfc4191#section-2.2
+/// [RFC 4191 § 2.3]: https://www.rfc-editor.org/rfc/rfc4191#section-2.3
 #[cfg(feature = "proto-ipv6-rio")]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -591,14 +662,28 @@ pub struct RouteInformation {
 
 #[cfg(feature = "proto-ipv6-rio")]
 impl RouteInformation {
+    /// Wire-format sentinel used for an infinite route lifetime.
+    pub const INFINITE_LIFETIME: Duration = Duration::from_secs(u32::MAX as u64);
+
+    /// Return whether the route lifetime represents infinity.
+    pub const fn has_infinite_lifetime(&self) -> bool {
+        self.route_lifetime.total_micros() >= Self::INFINITE_LIFETIME.total_micros()
+    }
+
     /// Validates the route information option.
     ///
-    /// Per [RFC 4191 § 2.2], options with the reserved (10) route preference
+    /// Per [RFC 4191 § 2.3], options with the reserved (10) route preference
     /// value must be ignored.
     ///
-    /// [RFC 4191 § 2.2]: https://www.rfc-editor.org/rfc/rfc4191#section-2.2
+    /// [RFC 4191 § 2.3]: https://www.rfc-editor.org/rfc/rfc4191#section-2.3
     pub fn is_valid_route_info(&self) -> bool {
-        !matches!(self.preference, RoutePreference::Unknown(_))
+        self.prefix_len <= 128 && self.preference.is_valid()
+    }
+
+    pub(crate) fn same_prefix(&self, other: &Self) -> bool {
+        self.prefix_len == other.prefix_len
+            && self.prefix_len <= 128
+            && Ipv6Cidr::new(self.prefix, self.prefix_len).contains_addr(&other.prefix)
     }
 }
 
@@ -685,29 +770,21 @@ impl<'a> Repr<'a> {
             Type::RouteInformation => {
                 // The prefix field holds 0, 8 or 16 octets depending on the
                 // option length, and the prefix length must fit in it.
-                let prefix_bits = (opt.data_len() as usize - 1) * 64;
-                if matches!(opt.data_len(), 1..=3) && opt.route_prefix_len() as usize <= prefix_bits
-                {
+                let length = opt.data_len();
+                let prefix_len = opt.route_prefix_len();
+                let valid_length = match prefix_len {
+                    0 => matches!(length, 1..=3),
+                    1..=64 => matches!(length, 2 | 3),
+                    65..=128 => length == 3,
+                    _ => false,
+                };
+                if valid_length {
                     Ok(Repr::RouteInformation(RouteInformation {
-                        prefix_len: opt.route_prefix_len(),
+                        prefix_len,
                         preference: opt.route_preference(),
                         route_lifetime: opt.route_lifetime(),
                         prefix: opt.route_prefix(),
                     }))
-                } else {
-                    Err(Error)
-                }
-            }
-            #[cfg(not(feature = "proto-ipv6-rio"))]
-            Type::RouteInformation => {
-                // Without Route Information Option support, treat the option
-                // as unknown.
-                if opt.data_len() != 0 {
-                    Ok(Repr::Unknown {
-                        type_: u8::from(Type::RouteInformation),
-                        length: opt.data_len(),
-                        data: opt.data(),
-                    })
                 } else {
                     Err(Error)
                 }
@@ -742,6 +819,7 @@ impl<'a> Repr<'a> {
             &Repr::Mtu(_) => field::MTU.end,
             #[cfg(feature = "proto-ipv6-rio")]
             &Repr::RouteInformation(RouteInformation { prefix_len, .. }) => {
+                assert!(prefix_len <= 128, "invalid Route Information prefix length");
                 field::ROUTE_PREFIX
                     + if prefix_len == 0 {
                         0
@@ -806,25 +884,24 @@ impl<'a> Repr<'a> {
                 opt.set_mtu(mtu);
             }
             #[cfg(feature = "proto-ipv6-rio")]
-            Repr::RouteInformation(RouteInformation {
-                prefix_len,
-                preference,
-                route_lifetime,
-                prefix,
-            }) => {
+            Repr::RouteInformation(route_info) => {
+                assert!(
+                    route_info.is_valid_route_info(),
+                    "invalid Route Information option"
+                );
                 opt.set_option_type(Type::RouteInformation);
-                let prefix_bytes = if prefix_len == 0 {
+                let prefix_bytes = if route_info.prefix_len == 0 {
                     0
-                } else if prefix_len <= 64 {
+                } else if route_info.prefix_len <= 64 {
                     8
                 } else {
                     16
                 };
                 opt.set_data_len((1 + prefix_bytes / 8) as u8);
-                opt.set_route_prefix_len(prefix_len);
-                opt.set_route_preference(preference);
-                opt.set_route_lifetime(route_lifetime);
-                opt.set_route_prefix(prefix);
+                opt.set_route_prefix_len(route_info.prefix_len);
+                opt.set_route_preference(route_info.preference);
+                opt.set_route_lifetime(route_info.route_lifetime);
+                opt.set_route_prefix(route_info.prefix);
             }
             Repr::Unknown {
                 type_: id,
@@ -1052,15 +1129,42 @@ mod test {
     #[test]
     #[cfg(not(feature = "proto-ipv6-rio"))]
     fn test_repr_parse_route_info_disabled() {
+        fn option_type_id(type_: Type) -> u8 {
+            // Keep this exhaustive so feature-off builds catch accidental
+            // additions to the public option-type API.
+            match type_ {
+                Type::SourceLinkLayerAddr => 1,
+                Type::TargetLinkLayerAddr => 2,
+                Type::PrefixInformation => 3,
+                Type::RedirectedHeader => 4,
+                Type::Mtu => 5,
+                Type::Unknown(id) => id,
+            }
+        }
+
         let opt = NdiscOption::new_checked(&ROUTE_INFO_OPT_SHORT_BYTES).unwrap();
+        assert_eq!(option_type_id(opt.option_type()), 24);
         assert_eq!(
             Repr::parse(&opt),
             Ok(Repr::Unknown {
-                type_: u8::from(Type::RouteInformation),
+                type_: 24,
                 length: 2,
                 data: &ROUTE_INFO_OPT_SHORT_BYTES[2..],
             })
         );
+
+        let mut bytes = [0; 32];
+        bytes[0] = 24;
+        bytes[1] = 4;
+        let opt = NdiscOption::new_checked(&bytes).unwrap();
+        assert!(matches!(
+            Repr::parse(&opt),
+            Ok(Repr::Unknown {
+                type_: 24,
+                length: 4,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1159,9 +1263,33 @@ mod test {
         bytes[2] = 65;
         assert_eq!(Repr::parse(&NdiscOption::new_unchecked(&bytes)), Err(Error));
 
-        // Lengths other than 1, 2 or 3 are invalid.
-        let bytes = [0x18, 0x04, 0x40, 0x00, 0x00, 0x00, 0x07, 0x08];
-        assert_eq!(NdiscOption::new_checked(&bytes), Err(Error));
+        // A complete, nonzero-length option is structurally valid, but an
+        // unsupported RIO length is rejected at the representation layer.
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&[0x18, 0x04, 0x40, 0x00, 0x00, 0x00, 0x07, 0x08]);
+        let option = NdiscOption::new_checked(&bytes).unwrap();
+        assert_eq!(option.route_prefix(), Ipv6Address::UNSPECIFIED);
+        assert_eq!(Repr::parse(&option), Err(Error));
+
+        let bytes = [0x18, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(Repr::parse(&NdiscOption::new_unchecked(&bytes)), Err(Error));
+
+        // All three lengths are valid for ::/0; any carried prefix bits are
+        // outside the prefix and therefore ignored by the receiver.
+        for length in 1..=3 {
+            let mut bytes = [0xff; 24];
+            bytes[0] = 0x18;
+            bytes[1] = length;
+            bytes[2] = 0;
+            assert!(matches!(
+                Repr::parse(&NdiscOption::new_unchecked(&bytes)),
+                Ok(Repr::RouteInformation(RouteInformation {
+                    prefix_len: 0,
+                    prefix: Ipv6Address::UNSPECIFIED,
+                    ..
+                }))
+            ));
+        }
     }
 
     #[test]
@@ -1188,6 +1316,15 @@ mod test {
         let mut opt = NdiscOption::new_unchecked(&mut bytes);
         repr.emit(&mut opt);
         assert_eq!(&opt.into_inner()[..], &ROUTE_INFO_OPT_SHORT_BYTES[..]);
+
+        let mut bytes = [0; 8];
+        let mut opt = NdiscOption::new_unchecked(&mut bytes);
+        opt.set_option_type(Type::RouteInformation);
+        opt.set_data_len(1);
+        opt.set_route_prefix_len(0);
+        opt.set_route_preference(RoutePreference::Medium);
+        opt.set_route_lifetime(Duration::from_secs(u32::MAX as u64 + 1));
+        assert_eq!(opt.route_lifetime(), RouteInformation::INFINITE_LIFETIME);
 
         // Bits after the advertised prefix length are reserved and must be
         // zeroed when emitting the option.
@@ -1222,5 +1359,44 @@ mod test {
             ..valid
         };
         assert!(!invalid.is_valid_route_info());
+
+        let invalid = RouteInformation {
+            prefix_len: 129,
+            ..valid
+        };
+        assert!(!invalid.is_valid_route_info());
+
+        let infinite = RouteInformation {
+            route_lifetime: RouteInformation::INFINITE_LIFETIME,
+            ..valid
+        };
+        assert!(infinite.has_infinite_lifetime());
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[should_panic(expected = "invalid Route Information option")]
+    fn test_repr_emit_rejects_reserved_preference() {
+        let mut bytes = [0; 16];
+        let repr = Repr::RouteInformation(RouteInformation {
+            prefix_len: 64,
+            preference: RoutePreference::Unknown(2),
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+        });
+        repr.emit(&mut NdiscOption::new_unchecked(&mut bytes));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[should_panic(expected = "invalid Route Information prefix length")]
+    fn test_repr_len_rejects_invalid_prefix_length() {
+        let repr = Repr::RouteInformation(RouteInformation {
+            prefix_len: 129,
+            preference: RoutePreference::Medium,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::UNSPECIFIED,
+        });
+        let _ = repr.buffer_len();
     }
 }

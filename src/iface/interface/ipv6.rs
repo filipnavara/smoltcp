@@ -510,6 +510,8 @@ impl InterfaceInner {
             NdiscRepr::RouterAdvert {
                 hop_limit: _,
                 flags: _,
+                #[cfg(feature = "proto-ipv6-rio")]
+                preference,
                 router_lifetime,
                 reachable_time: _,
                 retrans_time: _,
@@ -527,6 +529,8 @@ impl InterfaceInner {
                     self.slaac.process_advertisement(
                         &ip_repr.src_addr,
                         router_lifetime,
+                        #[cfg(feature = "proto-ipv6-rio")]
+                        preference,
                         prefix_info,
                         #[cfg(feature = "proto-ipv6-rio")]
                         route_info,
@@ -652,32 +656,32 @@ impl Interface {
                     let _ = addresses.push(IpCidr::Ipv6(address));
                 }
             }
-            addresses.retain(|address| {
-                if let IpCidr::Ipv6(address) = address {
-                    !removed_addresses.contains(address)
-                } else {
-                    true
-                }
+            addresses.retain(|address| match address {
+                IpCidr::Ipv6(address) => !removed_addresses.contains(address),
+                #[cfg(feature = "proto-ipv4")]
+                IpCidr::Ipv4(_) => true,
             });
         });
 
         {
-            let required_routes = self.inner.slaac.routes().into_iter().filter(|required| {
-                required.is_active(self.inner.slaac.routes().as_slice(), timestamp)
-            });
-
-            let removed_routes =
-                self.inner.slaac.routes().into_iter().filter(|route| {
-                    !route.is_active(self.inner.slaac.routes().as_slice(), timestamp)
-                });
+            let required_routes = self.inner.slaac.selected_routes(timestamp);
+            let previously_installed = self.inner.slaac.installed_routes().clone();
+            let mut installed_routes = Vec::new();
 
             self.inner.routes.update(|routes| {
-                routes.retain(|r| match (&r.cidr, &r.via_router) {
-                    (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => !removed_routes
-                        .clone()
-                        .any(|f| f.same_route(cidr, via_router)),
-                    _ => true,
-                });
+                for installed in previously_installed {
+                    // Remove only the exact entry previously mirrored by
+                    // SLAAC. A same-prefix application route has independent
+                    // ownership and must survive an RA withdrawal.
+                    if let Some(index) = routes.iter().position(|route| {
+                        route.cidr == installed.cidr.into()
+                            && route.via_router == installed.via_router.into()
+                            && route.preferred_until.is_none()
+                            && route.expires_at == installed.valid_until
+                    }) {
+                        routes.remove(index);
+                    }
+                }
 
                 for route in required_routes {
                     if routes.iter().all(|r| match (&r.cidr, &r.via_router) {
@@ -685,17 +689,28 @@ impl Interface {
                             !route.same_route(cidr, via_router)
                         }
                         // Routes from another address family cannot conflict.
+                        #[cfg(feature = "proto-ipv4")]
                         _ => true,
                     }) {
-                        let _ = routes.push(Route {
+                        let interface_route = Route {
                             cidr: route.cidr.into(),
                             via_router: route.via_router.into(),
                             preferred_until: None,
-                            expires_at: None,
-                        });
+                            expires_at: route.valid_until,
+                        };
+                        if routes.push(interface_route).is_ok() {
+                            installed_routes
+                                .push(crate::iface::slaac::InstalledRoute {
+                                    cidr: route.cidr,
+                                    via_router: route.via_router,
+                                    valid_until: route.valid_until,
+                                })
+                                .expect("installed SLAAC routes share route-table capacity");
+                        }
                     }
                 }
             });
+            self.inner.slaac.set_installed_routes(installed_routes);
         }
         self.inner.slaac_updated = timestamp;
         self.inner.slaac.update_slaac_state(timestamp);
@@ -737,5 +752,62 @@ impl Interface {
             )
             .unwrap();
         self.inner.slaac.rs_sent(self.inner.now);
+    }
+
+    /// Emit a requested RFC 4191 recovery probe without diverting useful traffic.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(super) fn ndisc_router_probe_egress(&mut self, device: &mut (impl Device + ?Sized)) {
+        #[cfg(feature = "medium-ip")]
+        if matches!(self.inner.caps.medium, Medium::Ip) {
+            return;
+        }
+
+        let now = self.inner.now;
+        let Some(router) = self.inner.neighbor_cache.router_probe_required(now) else {
+            return;
+        };
+        if !self.inner.slaac.is_router(&router, now) {
+            // The minute-long throttle can outlive the advertisement that
+            // requested it. Never probe a router once no valid learned route
+            // would have selected it.
+            self.inner.neighbor_cache.discard_router_resolution(&router);
+            return;
+        }
+
+        let solicit = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: router,
+            lladdr: Some(self.hardware_addr().into()),
+        });
+        let packet = Packet::new_ipv6(
+            Ipv6Repr {
+                src_addr: self.inner.get_source_address_ipv6(&router),
+                dst_addr: router.solicited_node(),
+                next_header: IpProtocol::Icmpv6,
+                payload_len: solicit.buffer_len(),
+                hop_limit: 0xff,
+            },
+            IpPayload::Icmpv6(solicit),
+        );
+        let Some(tx_token) = device.transmit(now) else {
+            return;
+        };
+
+        // Dispatch a distinct NS so the original packet keeps using its
+        // reachable fallback instead of stalling on neighbor resolution for
+        // the more desirable but currently avoided router.
+        if self
+            .inner
+            .dispatch_ip(
+                tx_token,
+                PacketMeta::default(),
+                packet,
+                &mut self.fragmenter,
+            )
+            .is_ok()
+        {
+            self.inner
+                .neighbor_cache
+                .router_recovery_probe_sent(router, now);
+        }
     }
 }

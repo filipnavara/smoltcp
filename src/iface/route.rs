@@ -170,10 +170,24 @@ impl Routes {
     }
 
     pub(crate) fn lookup(&self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
+        self.lookup_filtered(addr, timestamp, |_| true)
+            .map(|route| route.via_router)
+    }
+
+    pub(crate) fn lookup_filtered<F>(
+        &self,
+        addr: &IpAddress,
+        timestamp: Instant,
+        mut filter: F,
+    ) -> Option<Route>
+    where
+        F: FnMut(&Route) -> bool,
+    {
         assert!(addr.is_unicast());
 
         self.storage
             .iter()
+            .filter(|route| filter(route))
             // Keep only matching routes
             .filter(|route| {
                 if let Some(expires_at) = route.expires_at
@@ -185,7 +199,7 @@ impl Routes {
             })
             // pick the most specific one (highest prefix_len)
             .max_by_key(|route| route.cidr.prefix_len())
-            .map(|route| route.via_router)
+            .copied()
     }
 }
 
