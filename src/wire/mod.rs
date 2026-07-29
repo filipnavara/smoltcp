@@ -255,6 +255,12 @@ pub use self::ndisc::{
 };
 
 #[cfg(all(
+    feature = "proto-ipv6-rio",
+    any(feature = "medium-ethernet", feature = "medium-ieee802154")
+))]
+pub use self::ndisc::RouteInformationList as NdiscRouteInformationList;
+
+#[cfg(all(
     feature = "proto-ipv6",
     any(feature = "medium-ethernet", feature = "medium-ieee802154")
 ))]

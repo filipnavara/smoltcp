@@ -2,6 +2,8 @@ use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::config::IFACE_MAX_ROUTE_COUNT;
 use crate::time::Duration;
 use crate::wire::Ipv6Address;
 #[cfg(feature = "proto-ipv6-rio")]
@@ -190,6 +192,73 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
     }
 }
 
+/// Route Information options carried by a Router Advertisement.
+#[cfg(feature = "proto-ipv6-rio")]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RouteInformationList {
+    entries: [Option<NdiscRouteInformation>; IFACE_MAX_ROUTE_COUNT],
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl RouteInformationList {
+    /// Create an empty list.
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; IFACE_MAX_ROUTE_COUNT],
+        }
+    }
+
+    /// Append an option to the list.
+    ///
+    /// Returns the option unchanged if the configured route capacity has
+    /// already been reached.
+    pub fn push(
+        &mut self,
+        route_info: NdiscRouteInformation,
+    ) -> core::result::Result<(), NdiscRouteInformation> {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *entry = Some(route_info);
+            Ok(())
+        } else {
+            Err(route_info)
+        }
+    }
+
+    /// Iterate over the options in advertisement order.
+    pub fn iter(&self) -> impl Iterator<Item = NdiscRouteInformation> + '_ {
+        self.entries.iter().flatten().copied()
+    }
+
+    const fn buffer_len(&self) -> usize {
+        let mut len = 0;
+        let mut index = 0;
+        while index < IFACE_MAX_ROUTE_COUNT {
+            if let Some(route_info) = self.entries[index] {
+                len += NdiscOptionRepr::RouteInformation(route_info).buffer_len();
+            }
+            index += 1;
+        }
+        len
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl Default for RouteInformationList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl From<NdiscRouteInformation> for RouteInformationList {
+    fn from(route_info: NdiscRouteInformation) -> Self {
+        let mut list = Self::new();
+        let _ = list.push(route_info);
+        list
+    }
+}
+
 /// A high-level representation of an Neighbor Discovery packet header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -207,7 +276,7 @@ pub enum Repr<'a> {
         mtu: Option<u32>,
         prefix_info: Option<NdiscPrefixInformation>,
         #[cfg(feature = "proto-ipv6-rio")]
-        route_info: Option<NdiscRouteInformation>,
+        route_info: RouteInformationList,
     },
     NeighborSolicit {
         target_addr: Ipv6Address,
@@ -239,7 +308,7 @@ impl<'a> Repr<'a> {
         let (mut src_ll_addr, mut mtu, mut prefix_info, mut target_ll_addr, mut redirected_hdr) =
             (None, None, None, None, None);
         #[cfg(feature = "proto-ipv6-rio")]
-        let mut route_info = None;
+        let mut route_info = RouteInformationList::new();
 
         let mut offset = 0;
         while packet.payload().len() > offset {
@@ -254,7 +323,11 @@ impl<'a> Repr<'a> {
                     NdiscOptionRepr::RedirectedHeader(redirect) => redirected_hdr = Some(redirect),
                     NdiscOptionRepr::Mtu(m) => mtu = Some(m),
                     #[cfg(feature = "proto-ipv6-rio")]
-                    NdiscOptionRepr::RouteInformation(info) => route_info = Some(info),
+                    NdiscOptionRepr::RouteInformation(info) => {
+                        if info.is_valid_route_info() {
+                            let _ = route_info.push(info);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -328,8 +401,8 @@ impl<'a> Repr<'a> {
                     offset += NdiscOptionRepr::PrefixInformation(prefix_info).buffer_len();
                 }
                 #[cfg(feature = "proto-ipv6-rio")]
-                if let Some(route_info) = route_info {
-                    offset += NdiscOptionRepr::RouteInformation(route_info).buffer_len();
+                {
+                    offset += route_info.buffer_len();
                 }
                 field::RETRANS_TM.end + offset
             }
@@ -416,10 +489,12 @@ impl<'a> Repr<'a> {
                     }
                 }
                 #[cfg(feature = "proto-ipv6-rio")]
-                if let Some(route_info) = route_info {
+                for route_info in route_info.iter() {
                     let mut opt_pkt =
                         NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..]);
-                    NdiscOptionRepr::RouteInformation(route_info).emit(&mut opt_pkt)
+                    let opt = NdiscOptionRepr::RouteInformation(route_info);
+                    opt.emit(&mut opt_pkt);
+                    offset += opt.buffer_len();
                 }
             }
 
@@ -510,7 +585,7 @@ mod test {
             mtu: None,
             prefix_info: None,
             #[cfg(feature = "proto-ipv6-rio")]
-            route_info: None,
+            route_info: RouteInformationList::new(),
         })
     }
 
@@ -571,5 +646,89 @@ mod test {
             &ChecksumCapabilities::default(),
         );
         assert_eq!(&*packet.into_inner(), &ROUTER_ADVERT_BYTES[..]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    fn test_router_advert_ignores_route_info_when_disabled() {
+        let route_info = [
+            0x18, 0x02, 0x40, 0x00, 0x00, 0x00, 0x07, 0x08, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let mut bytes = [0; 40];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_msg_type(Message::RouterAdvert);
+        packet.set_msg_code(0);
+        packet.set_current_hop_limit(64);
+        packet.set_router_flags(RouterFlags::MANAGED);
+        packet.set_router_lifetime(Duration::from_secs(900));
+        packet.set_reachable_time(Duration::from_millis(900));
+        packet.set_retrans_time(Duration::from_millis(900));
+        packet.payload_mut()[..8].copy_from_slice(&SOURCE_LINK_LAYER_OPT);
+        packet.payload_mut()[8..].copy_from_slice(&route_info);
+        packet.fill_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2);
+        let packet = Packet::new_unchecked(&bytes[..]);
+
+        assert_eq!(
+            Icmpv6Repr::parse(
+                &MOCK_IP_ADDR_1,
+                &MOCK_IP_ADDR_2,
+                &packet,
+                &ChecksumCapabilities::default()
+            )
+            .unwrap(),
+            create_repr()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_router_advert_multiple_route_info() {
+        use crate::wire::{NdiscRouteInformation, NdiscRoutePreference};
+
+        let first = NdiscRouteInformation {
+            prefix_len: 64,
+            preference: NdiscRoutePreference::High,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0),
+        };
+        let second = NdiscRouteInformation {
+            prefix_len: 120,
+            preference: NdiscRoutePreference::Low,
+            route_lifetime: Duration::from_secs(900),
+            prefix: Ipv6Address::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0xff00),
+        };
+        let mut route_info = RouteInformationList::from(first);
+        route_info.push(second).unwrap();
+        let repr = Icmpv6Repr::Ndisc(Repr::RouterAdvert {
+            hop_limit: 64,
+            flags: RouterFlags::empty(),
+            router_lifetime: Duration::from_secs(900),
+            reachable_time: Duration::ZERO,
+            retrans_time: Duration::ZERO,
+            lladdr: None,
+            mtu: None,
+            prefix_info: None,
+            route_info,
+        });
+        let mut bytes = vec![0; repr.buffer_len()];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        repr.emit(
+            &MOCK_IP_ADDR_1,
+            &MOCK_IP_ADDR_2,
+            &mut packet,
+            &ChecksumCapabilities::default(),
+        );
+        let packet = Packet::new_unchecked(&bytes[..]);
+
+        assert_eq!(
+            Icmpv6Repr::parse(
+                &MOCK_IP_ADDR_1,
+                &MOCK_IP_ADDR_2,
+                &packet,
+                &ChecksumCapabilities::default()
+            ),
+            Ok(repr)
+        );
     }
 }

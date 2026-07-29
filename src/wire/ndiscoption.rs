@@ -245,6 +245,8 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                     // and must be 1, 2 or 3.
                     #[cfg(feature = "proto-ipv6-rio")]
                     Type::RouteInformation if matches!(data[field::LENGTH], 1..=3) => Ok(()),
+                    #[cfg(not(feature = "proto-ipv6-rio"))]
+                    Type::RouteInformation => Ok(()),
                     Type::Unknown(_) => Ok(()),
                     _ => Err(Error),
                 }
@@ -499,9 +501,18 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> NdiscOption<T> {
     #[inline]
     pub fn set_route_prefix(&mut self, addr: Ipv6Address) {
         let data = self.buffer.as_mut();
-        let prefix_len = data[field::LENGTH] as usize * 8 - field::ROUTE_PREFIX;
-        data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_len]
-            .copy_from_slice(&addr.octets()[..prefix_len]);
+        let prefix_bytes = data[field::LENGTH] as usize * 8 - field::ROUTE_PREFIX;
+        let prefix_len = usize::from(data[field::ROUTE_PREFIX_LEN]).min(prefix_bytes * 8);
+        let prefix = &mut data[field::ROUTE_PREFIX..field::ROUTE_PREFIX + prefix_bytes];
+        prefix.copy_from_slice(&addr.octets()[..prefix_bytes]);
+
+        let whole_bytes = prefix_len / 8;
+        let remaining_bits = prefix_len % 8;
+        if remaining_bits != 0 {
+            prefix[whole_bytes] &= 0xff << (8 - remaining_bits);
+        }
+        let zero_from = whole_bytes + usize::from(remaining_bits != 0);
+        prefix[zero_from..].fill(0);
     }
 }
 
@@ -1033,11 +1044,24 @@ mod test {
 
     // Route Information option with an 8-octet prefix field:
     // prefix 2001:db8:ffff::/48, medium preference, infinite lifetime.
-    #[cfg(feature = "proto-ipv6-rio")]
     static ROUTE_INFO_OPT_SHORT_BYTES: [u8; 16] = [
         0x18, 0x02, 0x30, 0x00, 0xff, 0xff, 0xff, 0xff, 0x20, 0x01, 0x0d, 0xb8, 0xff, 0xff, 0x00,
         0x00,
     ];
+
+    #[test]
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    fn test_repr_parse_route_info_disabled() {
+        let opt = NdiscOption::new_checked(&ROUTE_INFO_OPT_SHORT_BYTES).unwrap();
+        assert_eq!(
+            Repr::parse(&opt),
+            Ok(Repr::Unknown {
+                type_: u8::from(Type::RouteInformation),
+                length: 2,
+                data: &ROUTE_INFO_OPT_SHORT_BYTES[2..],
+            })
+        );
+    }
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
@@ -1164,6 +1188,23 @@ mod test {
         let mut opt = NdiscOption::new_unchecked(&mut bytes);
         repr.emit(&mut opt);
         assert_eq!(&opt.into_inner()[..], &ROUTE_INFO_OPT_SHORT_BYTES[..]);
+
+        // Bits after the advertised prefix length are reserved and must be
+        // zeroed when emitting the option.
+        let mut bytes = [0x2a; 16];
+        let repr = Repr::RouteInformation(RouteInformation {
+            prefix_len: 53,
+            preference: RoutePreference::Medium,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0x2001, 0x0db8, 0xffff, 0xffff, 0, 0, 0, 0),
+        });
+        let mut opt = NdiscOption::new_unchecked(&mut bytes);
+        repr.emit(&mut opt);
+        assert_eq!(
+            opt.route_prefix(),
+            Ipv6Address::new(0x2001, 0x0db8, 0xffff, 0xf800, 0, 0, 0, 0)
+        );
+        assert_eq!(&opt.into_inner()[14..16], &[0xf8, 0x00]);
     }
 
     #[test]

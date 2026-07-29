@@ -662,19 +662,14 @@ impl Interface {
         });
 
         {
-            let required_routes = self
-                .inner
-                .slaac
-                .routes()
-                .into_iter()
-                .filter(|required| required.is_valid(timestamp));
+            let required_routes = self.inner.slaac.routes().into_iter().filter(|required| {
+                required.is_active(self.inner.slaac.routes().as_slice(), timestamp)
+            });
 
-            let removed_routes = self
-                .inner
-                .slaac
-                .routes()
-                .into_iter()
-                .filter(|r| !r.is_valid(timestamp));
+            let removed_routes =
+                self.inner.slaac.routes().into_iter().filter(|route| {
+                    !route.is_active(self.inner.slaac.routes().as_slice(), timestamp)
+                });
 
             self.inner.routes.update(|routes| {
                 routes.retain(|r| match (&r.cidr, &r.via_router) {

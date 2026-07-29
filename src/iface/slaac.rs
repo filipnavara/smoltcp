@@ -4,9 +4,11 @@ use heapless::{LinearMap, Vec};
 use crate::config::{IFACE_MAX_PREFIX_COUNT, IFACE_MAX_ROUTE_COUNT};
 use crate::time::{Duration, Instant};
 use crate::wire::NdiscPrefixInfoFlags;
-#[cfg(feature = "proto-ipv6-rio")]
+#[cfg(all(feature = "proto-ipv6-rio", test))]
 use crate::wire::NdiscRouteInformation;
 use crate::wire::{Ipv6Address, Ipv6Cidr, NdiscPrefixInformation, ipv6::AddressExt};
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::wire::{NdiscRouteInformationList, NdiscRoutePreference};
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
 const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
@@ -30,6 +32,9 @@ pub(crate) struct Route {
     pub via_router: Ipv6Address,
     /// Valid lifetime of the route
     pub valid_until: Instant,
+    /// Preference advertised for the route.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub preference: NdiscRoutePreference,
 }
 
 /// Info associated with a prefix
@@ -71,6 +76,40 @@ impl Route {
     /// Get whether the route is still valid.
     pub fn is_valid(&self, now: Instant) -> bool {
         self.valid_until > now
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn preference_rank(&self) -> i8 {
+        match self.preference {
+            NdiscRoutePreference::Low => -1,
+            NdiscRoutePreference::Medium => 0,
+            NdiscRoutePreference::High => 1,
+            NdiscRoutePreference::Unknown(_) => -2,
+        }
+    }
+
+    /// Get whether this route should be synchronized to the interface.
+    ///
+    /// When identical prefixes are advertised by multiple routers, only
+    /// routes with the highest advertised preference are active.
+    pub fn is_active(&self, routes: &[Route], now: Instant) -> bool {
+        if !self.is_valid(now) {
+            return false;
+        }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if routes.iter().any(|route| {
+            route.is_valid(now)
+                && route.cidr == self.cidr
+                && route.preference_rank() > self.preference_rank()
+        }) {
+            return false;
+        }
+
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        let _ = routes;
+
+        true
     }
 }
 
@@ -146,14 +185,27 @@ impl Slaac {
         }
     }
 
-    fn add_route(&mut self, cidr: &Ipv6Cidr, router: &Ipv6Address, valid_until: Instant) {
+    fn add_route(
+        &mut self,
+        cidr: &Ipv6Cidr,
+        router: &Ipv6Address,
+        #[cfg(feature = "proto-ipv6-rio")] preference: NdiscRoutePreference,
+        valid_until: Instant,
+    ) {
         if let Some(route) = self.routes.iter_mut().find(|r| r.same_route(cidr, router)) {
             route.valid_until = valid_until;
+            #[cfg(feature = "proto-ipv6-rio")]
+            if route.preference != preference {
+                route.preference = preference;
+                self.sync_required = true;
+            }
         } else {
             let _ = self.routes.push(Route {
                 cidr: *cidr,
                 via_router: *router,
                 valid_until,
+                #[cfg(feature = "proto-ipv6-rio")]
+                preference,
             });
             self.sync_required = true;
         }
@@ -188,7 +240,7 @@ impl Slaac {
         source: &Ipv6Address,
         router_lifetime: Duration,              // default route lifetime
         prefix: Option<NdiscPrefixInformation>, // prefix info
-        #[cfg(feature = "proto-ipv6-rio")] route_info: Option<NdiscRouteInformation>, // route info
+        #[cfg(feature = "proto-ipv6-rio")] route_info: NdiscRouteInformationList, // route info
         now: Instant,
     ) {
         if let Some(prefix) = prefix
@@ -197,22 +249,34 @@ impl Slaac {
             self.process_prefix(prefix, now)
         }
 
+        if router_lifetime > Duration::ZERO {
+            self.add_route(
+                &IPV6_DEFAULT,
+                source,
+                #[cfg(feature = "proto-ipv6-rio")]
+                NdiscRoutePreference::Medium,
+                now + router_lifetime,
+            );
+        } else {
+            self.expire_route(&IPV6_DEFAULT, source);
+        }
+
         #[cfg(feature = "proto-ipv6-rio")]
-        if let Some(route_info) = route_info
-            && route_info.is_valid_route_info()
+        for route_info in route_info
+            .iter()
+            .filter(|route_info| route_info.is_valid_route_info())
         {
             let cidr = Ipv6Cidr::new(route_info.prefix, route_info.prefix_len);
             if route_info.route_lifetime > Duration::ZERO {
-                self.add_route(&cidr, source, now + route_info.route_lifetime);
+                self.add_route(
+                    &cidr,
+                    source,
+                    route_info.preference,
+                    now + route_info.route_lifetime,
+                );
             } else {
                 self.expire_route(&cidr, source);
             }
-        }
-
-        if router_lifetime > Duration::ZERO {
-            self.add_route(&IPV6_DEFAULT, source, now + router_lifetime);
-        } else {
-            self.expire_route(&IPV6_DEFAULT, source);
         }
 
         // Advertisement might be unsolicited
@@ -318,6 +382,8 @@ mod test {
     mod mock {
         use super::super::*;
         pub const SOURCE: Ipv6Address = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 0);
+        #[cfg(feature = "proto-ipv6-rio")]
+        pub const SOURCE_2: Ipv6Address = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 2);
         pub const PREFIX: NdiscPrefixInformation = NdiscPrefixInformation {
             prefix_len: 64,
             flags: NdiscPrefixInfoFlags::ADDRCONF,
@@ -331,6 +397,8 @@ mod test {
             cidr: Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0),
             via_router: SOURCE,
             valid_until: Instant::from_millis_const(100000),
+            #[cfg(feature = "proto-ipv6-rio")]
+            preference: crate::wire::NdiscRoutePreference::Medium,
         };
 
         #[cfg(feature = "proto-ipv6-rio")]
@@ -397,7 +465,7 @@ mod test {
             VALID,
             Some(PREFIX),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
         assert_eq!(slaac.phase, Phase::Start);
@@ -413,7 +481,7 @@ mod test {
             VALID,
             Some(PREFIX),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
         slaac.process_advertisement(
@@ -421,7 +489,7 @@ mod test {
             VALID,
             Some(PREFIX),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
         assert_eq!(slaac.phase, Phase::Maintaining);
@@ -491,7 +559,7 @@ mod test {
             VALID,
             Some(PREFIX),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
 
@@ -516,7 +584,7 @@ mod test {
             VALID,
             Some(expire_prefix),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
 
@@ -538,7 +606,7 @@ mod test {
             Duration::ZERO,
             Some(expire_prefix),
             #[cfg(feature = "proto-ipv6-rio")]
-            None,
+            NdiscRouteInformationList::new(),
             now,
         );
         assert!(slaac.sync_required(now));
@@ -564,17 +632,18 @@ mod test {
         let cidr = Ipv6Cidr::new(ROUTE_INFO.prefix, ROUTE_INFO.prefix_len);
 
         // RIO adds a route to the advertised prefix (alongside the default route)
-        slaac.process_advertisement(&SOURCE, VALID, None, Some(ROUTE_INFO), now);
+        slaac.process_advertisement(&SOURCE, VALID, None, ROUTE_INFO.into(), now);
         assert_eq!(slaac.routes().len(), 2);
         let route = slaac.routes().iter().find(|r| r.cidr == cidr).unwrap();
         assert_eq!(route.via_router, SOURCE);
         assert_eq!(route.valid_until, now + ROUTE_INFO.route_lifetime);
+        assert_eq!(route.preference, ROUTE_INFO.preference);
         assert!(route.is_valid(now));
 
         // A zero route lifetime expires only the RIO-learned route
         let mut expire = ROUTE_INFO;
         expire.route_lifetime = Duration::ZERO;
-        slaac.process_advertisement(&SOURCE, VALID, None, Some(expire), now);
+        slaac.process_advertisement(&SOURCE, VALID, None, expire.into(), now);
         assert!(
             !slaac
                 .routes()
@@ -598,6 +667,83 @@ mod test {
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
+    fn test_ra_multiple_route_info() {
+        let mut slaac = Slaac::new();
+        let now = Instant::from_millis(1);
+        let mut second = ROUTE_INFO;
+        second.prefix = Ipv6Address::new(0xfd00, 0xdb8, 1, 0, 0, 0, 0, 0);
+        let mut route_info = NdiscRouteInformationList::from(ROUTE_INFO);
+        route_info.push(second).unwrap();
+
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, route_info, now);
+
+        assert_eq!(slaac.routes().len(), 2);
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .any(|route| route.cidr.address() == ROUTE_INFO.prefix)
+        );
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .any(|route| route.cidr.address() == second.prefix)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_default_route_info_overrides_header() {
+        let now = Instant::from_millis(1);
+        let route_info = NdiscRouteInformation {
+            prefix_len: 0,
+            prefix: Ipv6Address::UNSPECIFIED,
+            preference: NdiscRoutePreference::High,
+            route_lifetime: Duration::from_secs(1800),
+        };
+        let mut slaac = Slaac::new();
+
+        slaac.process_advertisement(&SOURCE, VALID, None, route_info.into(), now);
+
+        let route = slaac.routes().first().unwrap();
+        assert_eq!(route.cidr, IPV6_DEFAULT);
+        assert_eq!(route.valid_until, now + route_info.route_lifetime);
+        assert_eq!(route.preference, NdiscRoutePreference::High);
+
+        let mut withdrawn = route_info;
+        withdrawn.route_lifetime = Duration::ZERO;
+        slaac.process_advertisement(&SOURCE, VALID, None, withdrawn.into(), now);
+        assert!(!slaac.routes().first().unwrap().is_valid(now));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_route_preference_selects_best_router() {
+        let now = Instant::from_millis(1);
+        let mut slaac = Slaac::new();
+        let mut low = ROUTE_INFO;
+        low.preference = NdiscRoutePreference::Low;
+
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, ROUTE_INFO.into(), now);
+        slaac.process_advertisement(&SOURCE_2, Duration::ZERO, None, low.into(), now);
+
+        let high_route = slaac
+            .routes()
+            .iter()
+            .find(|route| route.via_router == SOURCE)
+            .unwrap();
+        let low_route = slaac
+            .routes()
+            .iter()
+            .find(|route| route.via_router == SOURCE_2)
+            .unwrap();
+        assert!(high_route.is_active(slaac.routes().as_slice(), now));
+        assert!(!low_route.is_active(slaac.routes().as_slice(), now));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_ra_route_info_reserved_preference() {
         let mut slaac = Slaac::new();
         let now = Instant::from_millis(1);
@@ -605,7 +751,7 @@ mod test {
         // Options with the reserved preference must be ignored (RFC 4191)
         let mut reserved = ROUTE_INFO;
         reserved.preference = crate::wire::NdiscRoutePreference::Unknown(2);
-        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, Some(reserved), now);
+        slaac.process_advertisement(&SOURCE, Duration::ZERO, None, reserved.into(), now);
         assert!(slaac.routes().is_empty());
         assert!(!slaac.sync_required(now));
     }

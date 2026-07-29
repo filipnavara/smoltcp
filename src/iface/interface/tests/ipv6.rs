@@ -964,7 +964,7 @@ fn test_router_advertisement(#[case] medium: Medium) {
         mtu: None,
         prefix_info: Some(prefix_information),
         #[cfg(feature = "proto-ipv6-rio")]
-        route_info: None,
+        route_info: NdiscRouteInformationList::new(),
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),
@@ -1161,7 +1161,7 @@ fn test_router_advertisement_route_info(#[case] medium: Medium) {
         lladdr: None,
         mtu: None,
         prefix_info: None,
-        route_info: Some(route_information),
+        route_info: route_information.into(),
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),
@@ -1213,7 +1213,7 @@ fn test_router_advertisement_route_info(#[case] medium: Medium) {
     {
         let mut expired = route_information;
         expired.route_lifetime = Duration::ZERO;
-        *route_info = Some(expired);
+        *route_info = expired.into();
     }
 
     let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
@@ -1241,6 +1241,65 @@ fn test_router_advertisement_route_info(#[case] medium: Medium) {
     iface.routes_mut().update(|routes| {
         assert_eq!(routes.len(), 1);
         assert!(!routes.iter().any(|route| route.cidr == thread_cidr));
+    });
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_router_advertisement_route_preference() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let prefix = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 0);
+    let cidr = IpCidr::new(IpAddress::Ipv6(prefix), 64);
+    let low_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let high_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    let mut route_info = NdiscRouteInformation {
+        prefix_len: 64,
+        preference: NdiscRoutePreference::Low,
+        route_lifetime: Duration::from_secs(1800),
+        prefix,
+    };
+
+    iface.inner.slaac.process_advertisement(
+        &low_router,
+        Duration::ZERO,
+        None,
+        route_info.into(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+    iface.routes_mut().update(|routes| {
+        assert!(routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(low_router)
+        }));
+    });
+
+    route_info.preference = NdiscRoutePreference::High;
+    route_info.route_lifetime = Duration::from_secs(600);
+    iface.inner.slaac.process_advertisement(
+        &high_router,
+        Duration::ZERO,
+        None,
+        route_info.into(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+    iface.routes_mut().update(|routes| {
+        assert!(routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(high_router)
+        }));
+        assert!(!routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(low_router)
+        }));
+    });
+
+    iface.poll_maintenance(Instant::from_secs(600));
+    iface.routes_mut().update(|routes| {
+        assert!(routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(low_router)
+        }));
+        assert!(!routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(high_router)
+        }));
     });
 }
 
