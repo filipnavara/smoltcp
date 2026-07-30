@@ -31,6 +31,9 @@ pub enum Type {
     Unknown(u8),
 }
 
+// `Type` has one feature-gated variant. Keeping its conversion arms
+// local avoids changing every expansion of the shared enum helper merely to
+// make this one enum's match expressions carry the same cfg.
 impl From<u8> for Type {
     fn from(value: u8) -> Self {
         match value {
@@ -287,8 +290,9 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
         let len = data.len();
 
         if len < field::MIN_OPT_LEN || data[field::LENGTH] == 0 {
-            // A zero-length option cannot be skipped by an RA parser and
-            // creates invalid accessor ranges, so reject it structurally.
+            // A successful length check promises that accessors are
+            // safe. Length zero both prevents an enclosing option parser from
+            // advancing and creates underflowed/reversed accessor ranges.
             Err(Error)
         } else {
             let data_range = field::DATA(data[field::LENGTH]);
@@ -299,11 +303,12 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                     Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
-                    // Keep semantic RIO validation in Repr::parse. This lets
-                    // an RA ignore one malformed, nonzero-length RIO while
-                    // continuing with its other independently parsed options.
+                    // Semantic RIO validation belongs in Repr::parse so
+                    // one malformed option does not discard the rest of its
+                    // RA. Requiring the fixed header here still preserves
+                    // check_len's accessor-safety guarantee.
                     #[cfg(feature = "proto-ipv6-rio")]
-                    Type::RouteInformation => Ok(()),
+                    Type::RouteInformation if data_range.end >= field::ROUTE_PREFIX => Ok(()),
                     Type::Unknown(_) => Ok(()),
                     _ => Err(Error),
                 }
@@ -1024,7 +1029,10 @@ mod test {
 
     #[test]
     fn test_short_packet() {
-        assert_eq!(NdiscOption::new_checked(&[0x00, 0x00]), Err(Error));
+        let zero_length = [0x00, 0x00];
+        let option = NdiscOption::new_unchecked(&zero_length);
+        assert_eq!(option.check_len(), Err(Error));
+        assert_eq!(NdiscOption::new_checked(&zero_length), Err(Error));
         let bytes = [0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(NdiscOption::new_checked(&bytes), Err(Error));
     }

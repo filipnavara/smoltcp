@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(not(feature = "proto-ipv6-rio"))]
 use crate::iface::Route;
 
 /// Enum used for the process_hopbyhop function. In some cases, when discarding a packet, an ICMP
@@ -447,6 +448,27 @@ impl InterfaceInner {
         }
     }
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn reconcile_slaac_routes(&mut self, timestamp: Instant) {
+        let (slaac, routes) = (&mut self.slaac, &mut self.routes);
+        // Route-capacity-sized scratch vectors made this maintenance
+        // path consume hundreds of kilobytes of stack at supported large
+        // capacities. Routes owns its learned sidecar and reconciles exact
+        // public entries in place, preserving unchanged route order.
+        //
+        // Reconciliation consumes the most useful candidates first, while RA
+        // updates rely on identity ordering for bounded logarithmic lookup.
+        // Temporarily sort here and restore that update invariant afterwards.
+        slaac.sort_learned_routes_by_usefulness();
+        routes.reconcile_learned(slaac.learned_route_count(), |index| {
+            slaac.learned_route_at(index, timestamp)
+        });
+        slaac.restore_learned_route_identity_order();
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        self.neighbor_cache
+            .sync_router_resolutions(routes.revision(), routes.learned_router_addresses());
+    }
+
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(super) fn process_ndisc<'frame>(
         &mut self,
@@ -459,16 +481,126 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
-                if let Some(lladdr) = lladdr {
-                    let lladdr = check!(lladdr.parse(self.caps.medium));
-                    if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                #[cfg(feature = "proto-ipv6-rio")]
+                {
+                    if !target_addr.x_is_unicast()
+                        || (flags.contains(NdiscNeighborFlags::SOLICITED)
+                            && ip_repr.dst_addr.is_multicast())
+                    {
+                        // RFC 4861 section 7.1.2 makes both conditions invalid;
+                        // neither the mapping nor reachability state may change.
                         return None;
                     }
-                    if flags.contains(NdiscNeighborFlags::OVERRIDE)
-                        || !self.neighbor_cache.lookup(&ip_addr, self.now).found()
-                    {
-                        self.neighbor_cache.fill(ip_addr, lladdr, self.now)
+
+                    // RFC 4861 section 7.2.5 updates the Neighbor Cache
+                    // entry identified by the NA target, which can differ from
+                    // the IPv6 source for a proxy advertisement.
+                    let target_ip_addr = target_addr.into();
+                    let cached_hardware_addr =
+                        match self.neighbor_cache.lookup(&target_ip_addr, self.now) {
+                            NeighborAnswer::Found(hardware_addr) => Some(hardware_addr),
+                            NeighborAnswer::NotFound | NeighborAnswer::RateLimited => None,
+                        };
+                    let router_probe_outstanding = self
+                        .neighbor_cache
+                        .router_probe_outstanding(&target_addr, self.now);
+                    let neighbor_probe_outstanding = self
+                        .neighbor_cache
+                        .neighbor_probe_outstanding(&target_addr, self.now);
+                    let entry_exists = cached_hardware_addr.is_some()
+                        || router_probe_outstanding
+                        || neighbor_probe_outstanding;
+                    if !entry_exists {
+                        // RFC 4861 section 7.2.5 discards an NA when the host
+                        // has neither a live target entry nor an outstanding
+                        // solicitation. In particular, a historical failed
+                        // router record must not authorize unsolicited state.
+                        return None;
+                    }
+                    let was_router = self.neighbor_cache.is_router(&target_addr, self.now)
+                        || router_probe_outstanding
+                        || (neighbor_probe_outstanding
+                            && self.slaac.is_router(&self.routes, &target_addr, self.now));
+                    let mut transition_to_stale = false;
+                    let accepted = if let Some(lladdr) = lladdr {
+                        let lladdr = check!(lladdr.parse(self.caps.medium));
+                        if !lladdr.is_unicast() {
+                            return None;
+                        }
+
+                        if cached_hardware_addr.is_some_and(|cached| cached != lladdr)
+                            && !flags.contains(NdiscNeighborFlags::OVERRIDE)
+                        {
+                            // Override=0 explicitly protects a different
+                            // cached TLLA. The NA leaves both that mapping and
+                            // NUD reachability state unchanged.
+                            false
+                        } else {
+                            if flags.contains(NdiscNeighborFlags::OVERRIDE)
+                                || cached_hardware_addr.is_none()
+                            {
+                                transition_to_stale = cached_hardware_addr != Some(lladdr);
+                                self.neighbor_cache.fill(target_ip_addr, lladdr, self.now);
+                            }
+                            true
+                        }
+                    } else {
+                        // An NA without a TLLA can complete NUD only when a
+                        // usable target mapping already exists. Otherwise RFC
+                        // 4861 section 7.2.5 requires it to be discarded.
+                        cached_hardware_addr.is_some()
+                    };
+                    if !accepted {
+                        return None;
+                    }
+
+                    let is_router = flags.contains(NdiscNeighborFlags::ROUTER);
+                    let prior_live_role =
+                        self.neighbor_cache
+                            .set_router_if_live(&target_addr, is_router, self.now);
+                    debug_assert!(
+                        prior_live_role.is_some(),
+                        "an accepted NA must leave a live target mapping"
+                    );
+
+                    if is_router {
+                        if flags.contains(NdiscNeighborFlags::SOLICITED) {
+                            // Only a validated solicited NA from a router
+                            // confirms RFC 4861 reachability. Mapping refreshes
+                            // alone are not forward-path evidence.
+                            self.neighbor_cache.confirm_router_reachable(&target_addr);
+                        } else if transition_to_stale {
+                            // A changed unsolicited TLLA is STALE rather than
+                            // reachable, so it clears negative evidence without
+                            // acting as a reachability confirmation.
+                            self.neighbor_cache.mark_router_stale(&target_addr);
+                        }
+                    } else if was_router {
+                        // RFC 4861 section 7.2.5 invalidates routes only for a
+                        // TRUE-to-FALSE IsRouter transition. Reconcile now so
+                        // queued egress cannot use the former router first.
+                        if self.slaac.remove_router(&target_addr) {
+                            self.reconcile_slaac_routes(self.now);
+                        }
+                        self.neighbor_cache.discard_router_resolution(&target_addr);
+                    }
+                }
+
+                #[cfg(not(feature = "proto-ipv6-rio"))]
+                {
+                    // Preserve the pre-RIO mapping flow exactly. Tightening
+                    // generic NUD behavior is independent of route preference.
+                    let ip_addr = ip_repr.src_addr.into();
+                    if let Some(lladdr) = lladdr {
+                        let lladdr = check!(lladdr.parse(self.caps.medium));
+                        if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                            return None;
+                        }
+                        if flags.contains(NdiscNeighborFlags::OVERRIDE)
+                            || !self.neighbor_cache.lookup(&ip_addr, self.now).found()
+                        {
+                            self.neighbor_cache.fill(ip_addr, lladdr, self.now)
+                        }
                     }
                 }
                 None
@@ -483,6 +615,25 @@ impl InterfaceInner {
                     if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                         return None;
                     }
+
+                    #[cfg(feature = "proto-ipv6-rio")]
+                    {
+                        if !ip_repr.src_addr.x_is_unicast() {
+                            // An unspecified source with an SLLA is invalid;
+                            // avoiding a cache insertion also prevents an
+                            // unsolicited packet from clearing NUD evidence.
+                            return None;
+                        }
+                        if self.neighbor_cache.fill_from_neighbor_solicitation(
+                            ip_repr.src_addr,
+                            lladdr,
+                            self.now,
+                        ) {
+                            self.neighbor_cache.mark_router_stale(&ip_repr.src_addr);
+                        }
+                    }
+
+                    #[cfg(not(feature = "proto-ipv6-rio"))]
                     self.neighbor_cache
                         .fill(ip_repr.src_addr.into(), lladdr, self.now);
                 }
@@ -515,7 +666,10 @@ impl InterfaceInner {
                 router_lifetime,
                 reachable_time: _,
                 retrans_time: _,
-                lladdr: _,
+                #[cfg(feature = "proto-ipv6-rio")]
+                lladdr,
+                #[cfg(not(feature = "proto-ipv6-rio"))]
+                    lladdr: _,
                 mtu: _,
                 prefix_info,
                 #[cfg(feature = "proto-ipv6-rio")]
@@ -526,6 +680,37 @@ impl InterfaceInner {
                         || ip_repr.dst_addr.is_link_local())
                     && ip_repr.hop_limit == 255
                 {
+                    #[cfg(feature = "proto-ipv6-rio")]
+                    {
+                        let parsed_lladdr = lladdr
+                            .and_then(|lladdr| lladdr.parse(self.caps.medium).ok())
+                            .filter(HardwareAddress::is_unicast);
+                        let mapping_changed = if let Some(lladdr) = parsed_lladdr {
+                            self.neighbor_cache.fill_from_router_advertisement(
+                                ip_repr.src_addr,
+                                lladdr,
+                                self.now,
+                            )
+                        } else {
+                            // SLLA validity is independent of the surrounding
+                            // RA. Treat an absent or unusable mapping option as
+                            // unable to update the link-layer address, while
+                            // still applying valid header, PIO, and RIO data.
+                            self.neighbor_cache.set_router_if_live(
+                                &ip_repr.src_addr,
+                                true,
+                                self.now,
+                            );
+                            false
+                        };
+                        if mapping_changed {
+                            // Creating or changing an RA mapping produces
+                            // STALE state: it removes old negative evidence
+                            // without claiming bidirectional reachability.
+                            self.neighbor_cache.mark_router_stale(&ip_repr.src_addr);
+                        }
+                    }
+
                     self.slaac.process_advertisement(
                         &ip_repr.src_addr,
                         router_lifetime,
@@ -650,7 +835,7 @@ impl Interface {
             })
             .collect();
 
-        self.update_ip_addrs(|addresses| {
+        let update_addresses = |addresses: &mut Vec<IpCidr, IFACE_MAX_ADDR_COUNT>| {
             for address in required_addresses {
                 if !addresses.contains(&IpCidr::Ipv6(address)) {
                     let _ = addresses.push(IpCidr::Ipv6(address));
@@ -661,56 +846,83 @@ impl Interface {
                 #[cfg(feature = "proto-ipv4")]
                 IpCidr::Ipv4(_) => true,
             });
-        });
+        };
 
+        #[cfg(feature = "proto-ipv6-rio")]
         {
-            let required_routes = self.inner.slaac.selected_routes(timestamp);
-            let previously_installed = self.inner.slaac.installed_routes().clone();
-            let mut installed_routes = Vec::new();
+            // SLAAC changes addresses on the existing link; they do not move
+            // the interface to a different neighbor domain. Bypassing the
+            // public address-update flush also preserves the router mapping
+            // and IsRouter state learned from the RA that triggered this sync.
+            update_addresses(&mut self.inner.ip_addrs);
+            InterfaceInner::check_ip_addrs(&self.inner.ip_addrs);
+
+            #[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
+            if self.inner.caps.medium == Medium::Ethernet {
+                self.update_solicited_node_groups();
+            }
+        }
+
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        self.update_ip_addrs(update_addresses);
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            self.inner.reconcile_slaac_routes(timestamp);
+        }
+
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        {
+            // Keep the legacy mirror flow when RIO is disabled. RIO needs
+            // explicit ownership and expiry metadata, but applying that flow
+            // here would reorder equal-prefix application routes on each RA
+            // lifetime refresh and enlarge the default SLAAC state.
+            let required_routes = self
+                .inner
+                .slaac
+                .routes()
+                .iter()
+                .filter(|route| route.is_valid(timestamp));
+            let removed_routes = self
+                .inner
+                .slaac
+                .routes()
+                .iter()
+                .filter(|route| !route.is_valid(timestamp));
 
             self.inner.routes.update(|routes| {
-                for installed in previously_installed {
-                    // Remove only the exact entry previously mirrored by
-                    // SLAAC. A same-prefix application route has independent
-                    // ownership and must survive an RA withdrawal.
-                    if let Some(index) = routes.iter().position(|route| {
-                        route.cidr == installed.cidr.into()
-                            && route.via_router == installed.via_router.into()
-                            && route.preferred_until.is_none()
-                            && route.expires_at == installed.valid_until
-                    }) {
-                        routes.remove(index);
-                    }
-                }
+                routes.retain(|route| match (&route.cidr, &route.via_router) {
+                    (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => !removed_routes
+                        .clone()
+                        .any(|removed| removed.same_route(cidr, via_router)),
+                    #[cfg(feature = "proto-ipv4")]
+                    _ => true,
+                });
 
                 for route in required_routes {
-                    if routes.iter().all(|r| match (&r.cidr, &r.via_router) {
-                        (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
-                            !route.same_route(cidr, via_router)
-                        }
-                        // Routes from another address family cannot conflict.
-                        #[cfg(feature = "proto-ipv4")]
-                        _ => true,
-                    }) {
-                        let interface_route = Route {
+                    if routes
+                        .iter()
+                        .all(|existing| match (&existing.cidr, &existing.via_router) {
+                            (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
+                                !route.same_route(cidr, via_router)
+                            }
+                            #[cfg(feature = "proto-ipv4")]
+                            // Preserve the feature-off behavior exactly. This
+                            // legacy `all` predicate deliberately stops at a
+                            // route from the other address family; fixing that
+                            // behavior is independent of RFC 4191 support.
+                            _ => false,
+                        })
+                    {
+                        let _ = routes.push(Route {
                             cidr: route.cidr.into(),
                             via_router: route.via_router.into(),
                             preferred_until: None,
-                            expires_at: route.valid_until,
-                        };
-                        if routes.push(interface_route).is_ok() {
-                            installed_routes
-                                .push(crate::iface::slaac::InstalledRoute {
-                                    cidr: route.cidr,
-                                    via_router: route.via_router,
-                                    valid_until: route.valid_until,
-                                })
-                                .expect("installed SLAAC routes share route-table capacity");
-                        }
+                            expires_at: None,
+                        });
                     }
                 }
             });
-            self.inner.slaac.set_installed_routes(installed_routes);
         }
         self.inner.slaac_updated = timestamp;
         self.inner.slaac.update_slaac_state(timestamp);
@@ -755,23 +967,45 @@ impl Interface {
     }
 
     /// Emit a requested RFC 4191 recovery probe without diverting useful traffic.
+    ///
+    /// Returns `false` only when a due, still-useful probe could not be sent.
     #[cfg(feature = "proto-ipv6-rio")]
-    pub(super) fn ndisc_router_probe_egress(&mut self, device: &mut (impl Device + ?Sized)) {
+    pub(super) fn ndisc_router_probe_egress(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+    ) -> bool {
         #[cfg(feature = "medium-ip")]
         if matches!(self.inner.caps.medium, Medium::Ip) {
-            return;
+            return true;
         }
 
         let now = self.inner.now;
+        let (routes, neighbor_cache) = (&self.inner.routes, &mut self.inner.neighbor_cache);
+        neighbor_cache
+            .sync_router_resolutions(routes.revision(), routes.learned_router_addresses());
         let Some(router) = self.inner.neighbor_cache.router_probe_required(now) else {
-            return;
+            return true;
         };
-        if !self.inner.slaac.is_router(&router, now) {
-            // The minute-long throttle can outlive the advertisement that
-            // requested it. Never probe a router once no valid learned route
-            // would have selected it.
-            self.inner.neighbor_cache.discard_router_resolution(&router);
-            return;
+
+        let still_useful = self
+            .inner
+            .neighbor_cache
+            .router_probe_destinations(router)
+            .next()
+            .is_some_and(|destination| {
+                self.inner
+                    .router_probe_still_useful(router, destination, now)
+            });
+        if !still_useful {
+            // The one-minute throttle can outlive the route or preference that
+            // justified it. Recheck the bounded triggering set so an unrelated
+            // route from this router cannot cause an unsolicited probe.
+            if self.inner.slaac.is_router(&self.inner.routes, &router, now) {
+                self.inner.neighbor_cache.cancel_router_probe(&router);
+            } else {
+                self.inner.neighbor_cache.discard_router_resolution(&router);
+            }
+            return true;
         }
 
         let solicit = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
@@ -789,7 +1023,7 @@ impl Interface {
             IpPayload::Icmpv6(solicit),
         );
         let Some(tx_token) = device.transmit(now) else {
-            return;
+            return false;
         };
 
         // Dispatch a distinct NS so the original packet keeps using its
@@ -808,6 +1042,9 @@ impl Interface {
             self.inner
                 .neighbor_cache
                 .router_recovery_probe_sent(router, now);
+            true
+        } else {
+            false
         }
     }
 }

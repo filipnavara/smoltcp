@@ -644,11 +644,24 @@ fn ndisc_neighbor_advertisement_ethernet(#[case] medium: Medium) {
         response
     );
 
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    let neighbor_addr = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002);
+    #[cfg(feature = "proto-ipv6-rio")]
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
+        // RFC 4861 section 7.2.5 does not create a target entry from an
+        // advertisement when no solicitation or live mapping preceded it.
+        NeighborAnswer::NotFound,
+    );
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&IpAddress::Ipv6(neighbor_addr), iface.inner.now,),
         NeighborAnswer::Found(HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
             0, 0, 0, 0, 0, 1
         ]))),
@@ -701,11 +714,15 @@ fn ndisc_neighbor_advertisement_ethernet_multicast_addr(#[case] medium: Medium) 
         response
     );
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    let neighbor_addr = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002);
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    let neighbor_addr = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002);
     assert_eq!(
-        iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
-            iface.inner.now,
-        ),
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&IpAddress::Ipv6(neighbor_addr), iface.inner.now,),
         NeighborAnswer::NotFound,
     );
 }
@@ -754,15 +771,85 @@ fn ndisc_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
         response
     );
 
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    let neighbor_addr = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002);
+    #[cfg(feature = "proto-ipv6-rio")]
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
+        NeighborAnswer::NotFound,
+    );
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&IpAddress::Ipv6(neighbor_addr), iface.inner.now,),
         NeighborAnswer::Found(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
             &[0, 0, 0, 0, 0, 0, 0, 1]
         ))),
     );
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn delayed_neighbor_advertisements_complete_multiple_pending_resolutions() {
+    if crate::config::IFACE_NEIGHBOR_CACHE_COUNT < 2 {
+        return;
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let neighbors = [
+        Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2),
+        Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 3),
+    ];
+
+    for (seconds, neighbor) in neighbors.into_iter().enumerate() {
+        iface.inner.now = Instant::from_secs(seconds as i64);
+        assert_eq!(
+            iface.inner.lookup_hardware_addr(
+                MockTxToken,
+                &IpAddress::Ipv6(neighbor),
+                &mut iface.fragmenter,
+            ),
+            Err(DispatchError::NeighborPending)
+        );
+    }
+
+    let response_at = Instant::from_secs(2);
+    iface.inner.now = response_at;
+    let local_addr = iface.ipv6_addr().unwrap();
+    for (last_octet, neighbor) in [2, 3].into_iter().zip(neighbors) {
+        let hardware_addr = EthernetAddress([0x52, 0x54, 0, 0, 0, last_octet]);
+        assert!(
+            iface
+                .inner
+                .process_ndisc(
+                    Ipv6Repr {
+                        src_addr: neighbor,
+                        dst_addr: local_addr,
+                        next_header: IpProtocol::Icmpv6,
+                        payload_len: 0,
+                        hop_limit: 255,
+                    },
+                    NdiscRepr::NeighborAdvert {
+                        flags: NdiscNeighborFlags::SOLICITED,
+                        target_addr: neighbor,
+                        lladdr: Some(hardware_addr.into()),
+                    },
+                )
+                .is_none()
+        );
+        assert_eq!(
+            iface
+                .inner
+                .neighbor_cache
+                .lookup(&neighbor.into(), response_at),
+            NeighborAnswer::Found(HardwareAddress::Ethernet(hardware_addr))
+        );
+    }
 }
 
 #[rstest]
@@ -875,6 +962,12 @@ fn test_router_advertisement() {
     let caps = device.capabilities();
     let checksum_caps = &caps.checksum;
 
+    // RIO adds an eight-byte SLLA to this RA. Keep the backing frame exact
+    // sized in both configurations because ICMPv6 emission checksums the
+    // entire supplied payload buffer.
+    #[cfg(feature = "proto-ipv6-rio")]
+    let mut eth_bytes = vec![0u8; 110];
+    #[cfg(not(feature = "proto-ipv6-rio"))]
     let mut eth_bytes = vec![0u8; 102];
 
     // Create mac addresses with derived link local addresses
@@ -899,7 +992,7 @@ fn test_router_advertisement() {
     iface.update_ip_addrs(|ip_addrs| {
         ip_addrs.push(IpCidr::Ipv6(local_ip_addr)).unwrap();
     });
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6-rio"))]
     iface
         .routes_mut()
         .add_default_ipv4_route(Ipv4Address::new(192, 0, 2, 1))
@@ -962,7 +1055,16 @@ fn test_router_advertisement() {
         router_lifetime: Duration::from_secs(600),
         reachable_time: Duration::from_secs(0),
         retrans_time: Duration::from_secs(0),
-        lladdr: None,
+        lladdr: {
+            #[cfg(feature = "proto-ipv6-rio")]
+            {
+                Some(remote_hw_addr.into())
+            }
+            #[cfg(not(feature = "proto-ipv6-rio"))]
+            {
+                None
+            }
+        },
         mtu: None,
         prefix_info: Some(prefix_information),
         #[cfg(feature = "proto-ipv6-rio")]
@@ -987,19 +1089,31 @@ fn test_router_advertisement() {
         &ChecksumCapabilities::default(),
     );
 
+    #[cfg(feature = "proto-ipv6-rio")]
     device.rx_queue.push_back(frame.into_inner().to_vec());
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    iface.inner.process_ethernet(
+        &mut sockets,
+        PacketMeta::default(),
+        frame.into_inner(),
+        &mut iface.fragments,
+    );
+
+    // RIO routes must be visible to egress in the poll that receives the RA.
+    // The feature-off branch retains the original pre-ingress synchronization
+    // sequence above.
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
 
     // An unrelated IPv4 route must not prevent synchronization of an IPv6
     // route learned from a Router Advertisement.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6-rio"))]
     iface.routes_mut().update(|routes| {
         assert!(routes.iter().any(|route| {
             route.cidr == IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0), 0)
                 && route.via_router == IpAddress::Ipv6(remote_ip_addr.address())
         }));
     });
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6-rio"))]
     iface.routes_mut().remove_default_ipv4_route();
 
     // Expect to have these two addresses after the router advertisement
@@ -1013,6 +1127,25 @@ fn test_router_advertisement() {
     for (generated, expected) in iface.ip_addrs().iter().zip(expected_addrs.iter()) {
         assert_eq!(generated, expected);
     }
+    #[cfg(feature = "proto-ipv6-rio")]
+    {
+        // The same poll also synchronizes the new SLAAC address. That internal
+        // address update must retain the mapping and IsRouter state supplied
+        // by the RA rather than flushing the information it just learned.
+        assert_eq!(
+            iface
+                .inner
+                .neighbor_cache
+                .lookup(&IpAddress::Ipv6(remote_ip_addr.address()), Instant::ZERO,),
+            NeighborAnswer::Found(HardwareAddress::Ethernet(remote_hw_addr))
+        );
+        assert!(
+            iface
+                .inner
+                .neighbor_cache
+                .is_router(&remote_ip_addr.address(), Instant::ZERO)
+        );
+    }
     // Verify the pushed route matches expected
     iface.routes_mut().update(|route| {
         assert_eq!(route.len(), 1);
@@ -1025,7 +1158,10 @@ fn test_router_advertisement() {
             IpAddress::Ipv6(remote_ip_addr.address())
         );
         assert_eq!(route[0].preferred_until, None);
+        #[cfg(feature = "proto-ipv6-rio")]
         assert_eq!(route[0].expires_at, Some(Instant::from_secs(600)));
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        assert_eq!(route[0].expires_at, None);
     });
 
     // Craft a router advertisement with zero lifetime for the prefix
@@ -1158,7 +1294,7 @@ fn test_router_advertisement_route_info() {
         lladdr: None,
         mtu: None,
         prefix_info: None,
-        route_info: route_information.into(),
+        route_info: route_information.try_into().unwrap(),
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),
@@ -1204,7 +1340,7 @@ fn test_router_advertisement_route_info() {
     {
         let mut expired = route_information;
         expired.route_lifetime = Duration::ZERO;
-        *route_info = expired.into();
+        *route_info = expired.try_into().unwrap();
     }
 
     let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
@@ -1229,6 +1365,60 @@ fn test_router_advertisement_route_info() {
     });
 }
 
+#[cfg(all(
+    feature = "proto-ipv6-rio",
+    feature = "medium-ethernet",
+    feature = "socket-udp"
+))]
+struct SingleTxDevice {
+    inner: crate::tests::TestingDevice,
+    tx_available: bool,
+}
+
+#[cfg(all(
+    feature = "proto-ipv6-rio",
+    feature = "medium-ethernet",
+    feature = "socket-udp"
+))]
+impl SingleTxDevice {
+    fn new(inner: crate::tests::TestingDevice) -> Self {
+        Self {
+            inner,
+            tx_available: true,
+        }
+    }
+
+    fn replenish(&mut self) {
+        self.tx_available = true;
+    }
+}
+
+#[cfg(all(
+    feature = "proto-ipv6-rio",
+    feature = "medium-ethernet",
+    feature = "socket-udp"
+))]
+impl Device for SingleTxDevice {
+    type RxToken<'a> = crate::tests::RxToken;
+    type TxToken<'a> = crate::tests::TxToken<'a>;
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        None
+    }
+
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if !self.tx_available {
+            return None;
+        }
+        self.tx_available = false;
+        self.inner.transmit(timestamp)
+    }
+}
+
 #[test]
 #[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
 fn test_router_advertisement_route_preference() {
@@ -1249,7 +1439,7 @@ fn test_router_advertisement_route_preference() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::ZERO,
     );
     iface.poll_maintenance(Instant::ZERO);
@@ -1266,7 +1456,7 @@ fn test_router_advertisement_route_preference() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::ZERO,
     );
     iface.poll_maintenance(Instant::ZERO);
@@ -1274,7 +1464,7 @@ fn test_router_advertisement_route_preference() {
         assert!(routes.iter().any(|route| {
             route.cidr == cidr && route.via_router == IpAddress::Ipv6(high_router)
         }));
-        assert!(!routes.iter().any(|route| {
+        assert!(routes.iter().any(|route| {
             route.cidr == cidr && route.via_router == IpAddress::Ipv6(low_router)
         }));
     });
@@ -1295,6 +1485,24 @@ fn test_router_advertisement_route_preference() {
         iface.inner.route(&destination, Instant::from_secs(3)),
         Some(low_router.into())
     );
+
+    route_info.route_lifetime = Duration::from_secs(900);
+    iface.inner.slaac.process_advertisement(
+        &high_router,
+        Duration::ZERO,
+        NdiscRoutePreference::Medium,
+        None,
+        route_info.try_into().unwrap(),
+        Instant::from_secs(3),
+    );
+    // This RA only refreshes the learned route's lifetime. Reconciliation must
+    // preserve independent failed-router evidence so the fallback stays active.
+    iface.poll_maintenance(Instant::from_secs(3));
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(3)),
+        Some(low_router.into())
+    );
+
     assert_eq!(
         iface
             .inner
@@ -1337,15 +1545,175 @@ fn test_router_advertisement_route_preference() {
         Some(low_router.into())
     );
 
+    let local_addr = iface.ipv6_addr().unwrap();
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: high_router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::ROUTER | NdiscNeighborFlags::SOLICITED,
+                    target_addr: high_router,
+                    lladdr: None,
+                },
+            )
+            .is_none()
+    );
+    // Without a TLLA, an incomplete/no-mapping NA cannot complete NUD.
+    assert_eq!(
+        iface.inner.route(&destination, recovery_at),
+        Some(low_router.into())
+    );
+
     iface.inner.neighbor_cache.fill(
         high_router.into(),
         HardwareAddress::Ethernet(EthernetAddress([0x52, 0x54, 0, 0, 0, 3])),
         recovery_at,
     );
+    // Learning or refreshing a link-layer mapping is not RFC 4861
+    // reachability evidence, so an ordinary cache fill must leave the failed
+    // router behind the reachable lower-preference alternative.
+    assert_eq!(
+        iface.inner.route(&destination, recovery_at),
+        Some(low_router.into())
+    );
+
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: high_router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::ROUTER | NdiscNeighborFlags::SOLICITED,
+                    target_addr: high_router,
+                    lladdr: Some(EthernetAddress([0x52, 0x54, 0, 0, 0, 4]).into()),
+                },
+            )
+            .is_none()
+    );
+    // Override=0 protects a different cached TLLA and cannot be treated
+    // as reachability confirmation.
+    assert_eq!(
+        iface.inner.route(&destination, recovery_at),
+        Some(low_router.into())
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&high_router.into(), recovery_at),
+        NeighborAnswer::Found(HardwareAddress::Ethernet(EthernetAddress([
+            0x52, 0x54, 0, 0, 0, 3
+        ])))
+    );
+
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: high_router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::ROUTER | NdiscNeighborFlags::SOLICITED,
+                    target_addr: high_router,
+                    lladdr: None,
+                },
+            )
+            .is_none()
+    );
+    // A no-TLLA response is usable once the target mapping already exists.
     assert_eq!(
         iface.inner.route(&destination, recovery_at),
         Some(high_router.into())
     );
+
+    for _ in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(high_router, recovery_at);
+    }
+    let stale_at = Instant::from_secs(64);
+    assert_eq!(
+        iface.inner.route(&destination, stale_at),
+        Some(low_router.into())
+    );
+    iface.inner.now = stale_at;
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: high_router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::ROUTER | NdiscNeighborFlags::OVERRIDE,
+                    target_addr: high_router,
+                    lladdr: Some(EthernetAddress([0x52, 0x54, 0, 0, 0, 5]).into()),
+                },
+            )
+            .is_none()
+    );
+    // An accepted unsolicited TLLA change moves an RFC 4861 neighbor to
+    // STALE. It is not a reachability confirmation, but it is no longer known
+    // unreachable and must be eligible for RFC 4191 selection again.
+    assert_eq!(
+        iface.inner.route(&destination, stale_at),
+        Some(high_router.into())
+    );
+
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: high_router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::SOLICITED,
+                    target_addr: high_router,
+                    lladdr: None,
+                },
+            )
+            .is_none()
+    );
+    // An accepted R=0 advertisement says this node stopped routing.
+    // RFC 4861 requires learned routes through it to disappear before the
+    // next queued packet can use the node again.
+    assert_eq!(
+        iface.inner.route(&destination, stale_at),
+        Some(low_router.into())
+    );
+    iface.routes_mut().update(|routes| {
+        assert!(!routes.iter().any(|route| {
+            route.cidr == cidr && route.via_router == IpAddress::Ipv6(high_router)
+        }));
+    });
 
     iface.poll_maintenance(Instant::from_secs(600));
     iface.routes_mut().update(|routes| {
@@ -1356,6 +1724,604 @@ fn test_router_advertisement_route_preference() {
             route.cidr == cidr && route.via_router == IpAddress::Ipv6(high_router)
         }));
     });
+
+    iface.routes_mut().update(|routes| {
+        routes
+            .retain(|route| route.cidr != cidr || route.via_router != IpAddress::Ipv6(low_router));
+    });
+    // The public route table is authoritative. Removing the surviving
+    // learned route must stop forwarding immediately instead of leaving a
+    // hidden SLAAC candidate active until the next maintenance pass.
+    assert_eq!(iface.inner.route(&destination, recovery_at), None);
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_untracked_r0_neighbor_advertisement_keeps_learned_route() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let destination = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+    iface.inner.slaac.process_advertisement(
+        &router,
+        Duration::from_secs(600),
+        NdiscRoutePreference::High,
+        None,
+        NdiscRouteInformationList::new(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+    assert_eq!(
+        iface.inner.route(&destination, Instant::ZERO),
+        Some(router.into())
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&router.into(), Instant::ZERO),
+        NeighborAnswer::NotFound
+    );
+
+    let local_addr = iface.ipv6_addr().unwrap();
+    for last_octet in [2, 3] {
+        assert!(
+            iface
+                .inner
+                .process_ndisc(
+                    Ipv6Repr {
+                        src_addr: router,
+                        dst_addr: local_addr,
+                        next_header: IpProtocol::Icmpv6,
+                        payload_len: 0,
+                        hop_limit: 255,
+                    },
+                    NdiscRepr::NeighborAdvert {
+                        flags: NdiscNeighborFlags::empty(),
+                        target_addr: router,
+                        lladdr: Some(EthernetAddress([0x52, 0x54, 0, 0, 0, last_octet]).into(),),
+                    },
+                )
+                .is_none()
+        );
+        // Repeated no-entry advertisements must remain side-effect free; the
+        // first one cannot bootstrap cache state that authorizes the second.
+        assert_eq!(
+            iface
+                .inner
+                .neighbor_cache
+                .lookup(&router.into(), Instant::ZERO),
+            NeighborAnswer::NotFound
+        );
+        assert_eq!(
+            iface.inner.route(&destination, Instant::ZERO),
+            Some(router.into())
+        );
+    }
+
+    for seconds in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(router, Instant::from_secs(seconds));
+    }
+    let failed_at = Instant::from_secs(3);
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router_unreachable(&router, failed_at)
+    );
+    iface.inner.now = failed_at;
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::empty(),
+                    target_addr: router,
+                    lladdr: Some(EthernetAddress([0x52, 0x54, 0, 0, 0, 4]).into()),
+                },
+            )
+            .is_none()
+    );
+    // A completed failed-resolution record is routing evidence, not a live
+    // Neighbor Cache entry. It cannot authorize a later unsolicited R=0.
+    assert_eq!(
+        iface.inner.route(&destination, failed_at),
+        Some(router.into())
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(&router.into(), failed_at),
+        NeighborAnswer::NotFound
+    );
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_outstanding_r0_neighbor_advertisement_withdraws_learned_route() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let destination = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+    iface.inner.slaac.process_advertisement(
+        &router,
+        Duration::from_secs(600),
+        NdiscRoutePreference::High,
+        None,
+        NdiscRouteInformationList::new(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+
+    for seconds in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(router, Instant::from_secs(seconds));
+    }
+    let failed_at = Instant::from_secs(3);
+    iface.inner.now = failed_at;
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router_unreachable(&router, failed_at)
+    );
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &destination, &mut iface.fragmenter,),
+        Err(DispatchError::NeighborPending)
+    );
+
+    let local_addr = iface.ipv6_addr().unwrap();
+    assert!(
+        iface
+            .inner
+            .process_ndisc(
+                Ipv6Repr {
+                    src_addr: router,
+                    dst_addr: local_addr,
+                    next_header: IpProtocol::Icmpv6,
+                    payload_len: 0,
+                    hop_limit: 255,
+                },
+                NdiscRepr::NeighborAdvert {
+                    flags: NdiscNeighborFlags::SOLICITED,
+                    target_addr: router,
+                    lladdr: Some(EthernetAddress([0x52, 0x54, 0, 0, 0, 2]).into()),
+                },
+            )
+            .is_none()
+    );
+
+    // A new ordinary lookup can revisit a router after its earlier resolution
+    // failed. Its actually dispatched NS creates a fresh INCOMPLETE entry, so
+    // the solicited R=0 response is still a TRUE-to-FALSE transition.
+    assert_eq!(iface.inner.route(&destination, failed_at), None);
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_ra_and_ns_slla_changes_move_failed_router_to_stale() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.inner.slaac_enabled = true;
+    let high_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let low_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    let destination = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    let local_addr = iface.ipv6_addr().unwrap();
+    let high_hardware_a = EthernetAddress([0x52, 0x54, 0, 0, 0, 2]);
+    let high_hardware_b = EthernetAddress([0x52, 0x54, 0, 0, 0, 4]);
+    let high_hardware_c = EthernetAddress([0x52, 0x54, 0, 0, 0, 5]);
+    let router_advert = |lladdr| NdiscRepr::RouterAdvert {
+        hop_limit: 255,
+        flags: NdiscRouterFlags::empty(),
+        preference: NdiscRoutePreference::High,
+        router_lifetime: Duration::from_secs(600),
+        reachable_time: Duration::ZERO,
+        retrans_time: Duration::ZERO,
+        lladdr: Some(lladdr),
+        mtu: None,
+        prefix_info: None,
+        route_info: NdiscRouteInformationList::new(),
+    };
+    let high_ip_repr = Ipv6Repr {
+        src_addr: high_router,
+        dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: 0,
+        hop_limit: 255,
+    };
+
+    let _ = iface
+        .inner
+        .process_ndisc(high_ip_repr, router_advert(high_hardware_a.into()));
+    iface.inner.slaac.process_advertisement(
+        &low_router,
+        Duration::from_secs(600),
+        NdiscRoutePreference::Low,
+        None,
+        NdiscRouteInformationList::new(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+    assert_eq!(
+        iface.inner.route(&destination, Instant::ZERO),
+        Some(high_router.into())
+    );
+
+    for seconds in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(high_router, Instant::from_secs(seconds));
+    }
+    iface.inner.now = Instant::from_secs(3);
+    assert_eq!(
+        iface.inner.route(&destination, iface.inner.now),
+        Some(low_router.into())
+    );
+
+    let _ = iface
+        .inner
+        .process_ndisc(high_ip_repr, router_advert(high_hardware_a.into()));
+    iface.poll_maintenance(Instant::from_secs(3));
+    // An RA with the same SLLA refreshes IsRouter but provides no new NUD
+    // evidence, so the known-unreachable router must remain suppressed.
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(3)),
+        Some(low_router.into())
+    );
+
+    let _ = iface
+        .inner
+        .process_ndisc(high_ip_repr, router_advert(high_hardware_b.into()));
+    iface.poll_maintenance(Instant::from_secs(3));
+    // A changed RA mapping enters STALE rather than REACHABLE. This simplified
+    // cache represents STALE as unknown, making the preferred router eligible
+    // again without treating the RA as a reachability confirmation.
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(3)),
+        Some(high_router.into())
+    );
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router(&high_router, Instant::from_secs(3))
+    );
+
+    for seconds in 3..6 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(high_router, Instant::from_secs(seconds));
+    }
+    iface.inner.now = Instant::from_secs(6);
+    assert_eq!(
+        iface.inner.route(&destination, iface.inner.now),
+        Some(low_router.into())
+    );
+
+    let solicit = |lladdr| NdiscRepr::NeighborSolicit {
+        target_addr: local_addr,
+        lladdr: Some(lladdr),
+    };
+    let solicit_ip_repr = Ipv6Repr {
+        src_addr: high_router,
+        dst_addr: local_addr.solicited_node(),
+        next_header: IpProtocol::Icmpv6,
+        payload_len: 0,
+        hop_limit: 255,
+    };
+    let _ = iface
+        .inner
+        .process_ndisc(solicit_ip_repr, solicit(high_hardware_b.into()));
+    // An NS carries no router-role information and the unchanged mapping is
+    // not NUD evidence, so both IsRouter and the failed state are preserved.
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router(&high_router, iface.inner.now)
+    );
+    assert_eq!(
+        iface.inner.route(&destination, iface.inner.now),
+        Some(low_router.into())
+    );
+
+    let _ = iface
+        .inner
+        .process_ndisc(solicit_ip_repr, solicit(high_hardware_c.into()));
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router(&high_router, iface.inner.now)
+    );
+    assert_eq!(
+        iface.inner.route(&destination, iface.inner.now),
+        Some(high_router.into())
+    );
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_router_advertisement_ignores_unusable_slla_but_keeps_route_info() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.inner.slaac_enabled = true;
+    let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let prefix = Ipv6Address::new(0x2001, 0xdb8, 0x42, 0, 0, 0, 0, 0);
+    let route_info = NdiscRouteInformation {
+        prefix_len: 64,
+        preference: NdiscRoutePreference::High,
+        route_lifetime: Duration::from_secs(600),
+        prefix,
+    };
+    let advertisement = NdiscRepr::RouterAdvert {
+        hop_limit: 64,
+        flags: NdiscRouterFlags::empty(),
+        preference: NdiscRoutePreference::Medium,
+        router_lifetime: Duration::ZERO,
+        reachable_time: Duration::ZERO,
+        retrans_time: Duration::ZERO,
+        lladdr: Some(EthernetAddress([0xff; 6]).into()),
+        mtu: None,
+        prefix_info: None,
+        route_info: route_info.try_into().unwrap(),
+    };
+    let ip_repr = Ipv6Repr {
+        src_addr: router,
+        dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: advertisement.buffer_len(),
+        hop_limit: 255,
+    };
+
+    let _ = iface.inner.process_ndisc(ip_repr, advertisement);
+    iface.poll_maintenance(Instant::ZERO);
+
+    // The unusable SLLA cannot create a mapping, but that independent option
+    // must not suppress the valid RIO carried by the same advertisement.
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&router.into(), Instant::ZERO),
+        NeighborAnswer::NotFound
+    );
+    assert_eq!(
+        iface.inner.route(
+            &IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0x42, 0, 0, 0, 0, 1)),
+            Instant::ZERO,
+        ),
+        Some(router.into())
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "proto-ipv6-rio",
+    feature = "medium-ethernet",
+    feature = "socket-udp"
+))]
+fn test_recovery_probe_has_bounded_fairness_after_application_packet() {
+    use crate::socket::udp;
+
+    let (mut iface, mut sockets, mut backing_device) = setup(Medium::Ethernet);
+    // Drain membership reports before imposing the one-token budget; they are
+    // unrelated to the application-versus-recovery ordering under test.
+    iface.poll_egress(Instant::ZERO, &mut backing_device, &mut sockets);
+    backing_device.tx_queue.clear();
+    let mut device = SingleTxDevice::new(backing_device);
+
+    let prefix = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 0);
+    let probe_destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let app_destination = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 2);
+    let high_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let low_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    let route_info = |prefix, preference, route_lifetime| NdiscRouteInformation {
+        prefix_len: 64,
+        preference,
+        route_lifetime,
+        prefix,
+    };
+
+    for (router, preference) in [
+        (high_router, NdiscRoutePreference::High),
+        (low_router, NdiscRoutePreference::Low),
+    ] {
+        iface.inner.slaac.process_advertisement(
+            &router,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info(prefix, preference, Duration::from_secs(600))
+                .try_into()
+                .unwrap(),
+            Instant::ZERO,
+        );
+    }
+    iface.poll_maintenance(Instant::ZERO);
+    for seconds in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(high_router, Instant::from_secs(seconds));
+    }
+    assert_eq!(
+        iface
+            .inner
+            .route_with_rio_probes(&probe_destination.into(), Instant::from_secs(3)),
+        Some(low_router.into())
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .router_resolution_poll_at(Instant::from_secs(4)),
+        Some(Instant::from_secs(63))
+    );
+    iface.inner.neighbor_cache.fill(
+        app_destination.into(),
+        HardwareAddress::Ethernet(EthernetAddress([0x52, 0x54, 0, 0, 0, 4])),
+        Instant::from_secs(4),
+    );
+
+    let rx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 32]);
+    let tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 32]);
+    let mut socket = udp::Socket::new(rx_buffer, tx_buffer);
+    socket.bind(1234).unwrap();
+    socket
+        .send_slice(b"first", IpEndpoint::new(app_destination.into(), 4321))
+        .unwrap();
+    let handle = sockets.add(socket);
+
+    let recovery_at = Instant::from_secs(63);
+    let requested_router = iface
+        .inner
+        .neighbor_cache
+        .router_probe_required(recovery_at)
+        .unwrap();
+    assert_eq!(requested_router, high_router);
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .router_probe_destinations(requested_router)
+            .any(|stored| stored == probe_destination)
+    );
+    iface.poll_egress(recovery_at, &mut device, &mut sockets);
+    let frame_bytes = device.inner.tx_queue.pop_front().unwrap();
+    let frame = EthernetFrame::new_checked(frame_bytes.as_slice()).unwrap();
+    let packet = Ipv6Packet::new_checked(frame.payload()).unwrap();
+    assert_eq!(
+        Ipv6Repr::parse(&packet).unwrap().next_header,
+        IpProtocol::Udp
+    );
+    assert!(device.inner.tx_queue.is_empty());
+
+    sockets
+        .get_mut::<udp::Socket>(handle)
+        .send_slice(b"second", IpEndpoint::new(app_destination.into(), 4321))
+        .unwrap();
+    device.replenish();
+    iface.poll_egress(recovery_at, &mut device, &mut sockets);
+    let frame_bytes = device.inner.tx_queue.pop_front().unwrap();
+    let frame = EthernetFrame::new_checked(frame_bytes.as_slice()).unwrap();
+    let packet = Ipv6Packet::new_checked(frame.payload()).unwrap();
+    let ipv6 = Ipv6Repr::parse(&packet).unwrap();
+    let probe = Icmpv6Repr::parse(
+        &ipv6.src_addr,
+        &ipv6.dst_addr,
+        &Icmpv6Packet::new_checked(packet.payload()).unwrap(),
+        &ChecksumCapabilities::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        probe,
+        Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: high_router,
+            lladdr: Some(EthernetAddress([0x02; 6]).into()),
+        })
+    );
+    assert!(sockets.get::<udp::Socket>(handle).send_queue() > 0);
+
+    device.replenish();
+    iface.poll_egress(recovery_at, &mut device, &mut sockets);
+    let frame_bytes = device.inner.tx_queue.pop_front().unwrap();
+    let frame = EthernetFrame::new_checked(frame_bytes.as_slice()).unwrap();
+    let packet = Ipv6Packet::new_checked(frame.payload()).unwrap();
+    assert_eq!(
+        Ipv6Repr::parse(&packet).unwrap().next_header,
+        IpProtocol::Udp
+    );
+    assert_eq!(sockets.get::<udp::Socket>(handle).send_queue(), 0);
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_router_resolution_capacity_preserves_reachable_fallback() {
+    if crate::config::IFACE_MAX_ROUTE_COUNT < 3 {
+        return;
+    }
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let prefix = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 0);
+    let destination = IpAddress::Ipv6(Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1));
+    let high_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let medium_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    let low_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 4);
+
+    for (router, preference) in [
+        (high_router, NdiscRoutePreference::High),
+        (medium_router, NdiscRoutePreference::Medium),
+        (low_router, NdiscRoutePreference::Low),
+    ] {
+        let route_info = NdiscRouteInformation {
+            prefix_len: 64,
+            preference,
+            route_lifetime: Duration::from_secs(600),
+            prefix,
+        };
+        iface.inner.slaac.process_advertisement(
+            &router,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info.try_into().unwrap(),
+            Instant::ZERO,
+        );
+        iface.poll_maintenance(Instant::ZERO);
+    }
+    assert_eq!(
+        iface.inner.route(&destination, Instant::ZERO),
+        Some(high_router.into())
+    );
+
+    for seconds in 0..3 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(high_router, Instant::from_secs(seconds));
+    }
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(3)),
+        Some(medium_router.into())
+    );
+
+    for seconds in 3..6 {
+        iface
+            .inner
+            .neighbor_cache
+            .record_router_probe(medium_router, Instant::from_secs(seconds));
+    }
+    // Forgetting the first failed router when the resolution store fills
+    // makes it eligible again and prevents reaching this lower preference.
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(6)),
+        Some(low_router.into())
+    );
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router_unreachable(&high_router, Instant::from_secs(6))
+    );
+    assert!(
+        iface
+            .inner
+            .neighbor_cache
+            .is_router_unreachable(&medium_router, Instant::from_secs(6))
+    );
 }
 
 #[test]
@@ -1382,7 +2348,7 @@ fn test_unreachable_rio_uses_configured_fallback_and_requests_probe() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::ZERO,
     );
     iface.poll_maintenance(Instant::ZERO);
@@ -1423,12 +2389,17 @@ fn test_unreachable_rio_uses_configured_fallback_and_requests_probe() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::from_secs(4),
     );
+    // This test invokes the internal SLAAC state machine directly,
+    // bypassing the normal post-ingress synchronization in `poll()`.
+    iface.poll_maintenance(Instant::from_secs(4));
     iface.inner.now = Instant::from_secs(63);
     iface.ndisc_router_probe_egress(&mut device);
-    // The queued request outlived its route, so §3.5 no longer permits it.
+    // Keep the RA's router lifetime at zero so this test isolates the
+    // learned /64. Once that route is withdrawn, no learned route remains to
+    // authorize the delayed RFC 4191 recovery probe.
     assert!(device.tx_queue.is_empty());
     assert_eq!(
         iface
@@ -1455,7 +2426,7 @@ fn test_slaac_withdrawal_preserves_static_route() {
 
     iface.routes_mut().update(|routes| {
         routes
-            .push(Route {
+            .push(crate::iface::Route {
                 cidr,
                 via_router: router.into(),
                 preferred_until: None,
@@ -1468,7 +2439,7 @@ fn test_slaac_withdrawal_preserves_static_route() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::ZERO,
     );
     iface.poll_maintenance(Instant::ZERO);
@@ -1479,7 +2450,7 @@ fn test_slaac_withdrawal_preserves_static_route() {
         Duration::ZERO,
         NdiscRoutePreference::Medium,
         None,
-        route_info.into(),
+        route_info.try_into().unwrap(),
         Instant::from_secs(1),
     );
     iface.poll_maintenance(Instant::from_secs(1));
@@ -1490,6 +2461,112 @@ fn test_slaac_withdrawal_preserves_static_route() {
         assert_eq!(routes[0].via_router, router.into());
         assert_eq!(routes[0].expires_at, None);
     });
+}
+
+#[test]
+#[cfg(all(feature = "proto-ipv6-rio", feature = "medium-ethernet"))]
+fn test_slaac_withdrawal_preserves_application_copy_of_learned_route() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let prefix = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 0);
+    let cidr = IpCidr::new(prefix.into(), 64);
+    let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let mut route_info = NdiscRouteInformation {
+        prefix_len: 64,
+        preference: NdiscRoutePreference::High,
+        route_lifetime: Duration::from_secs(1800),
+        prefix,
+    };
+
+    iface.inner.slaac.process_advertisement(
+        &router,
+        Duration::ZERO,
+        NdiscRoutePreference::Medium,
+        None,
+        route_info.try_into().unwrap(),
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+
+    // Add an exact application copy in a separate public-table update. With
+    // two indistinguishable occurrences, ownership must be dropped rather
+    // than guessed.
+    iface.routes_mut().update(|routes| {
+        let learned = *routes
+            .iter()
+            .find(|route| route.cidr == cidr && route.via_router == router.into())
+            .unwrap();
+        routes.push(learned).unwrap();
+    });
+    iface.routes_mut().update(|routes| {
+        routes.remove(
+            routes
+                .iter()
+                .position(|route| route.cidr == cidr && route.via_router == router.into())
+                .unwrap(),
+        );
+    });
+
+    route_info.route_lifetime = Duration::ZERO;
+    iface.inner.slaac.process_advertisement(
+        &router,
+        Duration::ZERO,
+        NdiscRoutePreference::Medium,
+        None,
+        route_info.try_into().unwrap(),
+        Instant::from_secs(1),
+    );
+    iface.poll_maintenance(Instant::from_secs(1));
+
+    iface.routes_mut().update(|routes| {
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].cidr, cidr);
+        assert_eq!(routes[0].via_router, router.into());
+    });
+}
+
+#[test]
+#[cfg(all(
+    not(feature = "proto-ipv6-rio"),
+    feature = "proto-ipv6-slaac",
+    feature = "medium-ethernet"
+))]
+fn test_slaac_refresh_preserves_feature_off_route_order() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let learned_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    let configured_router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+    let destination = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+
+    iface.inner.slaac.process_advertisement(
+        &learned_router,
+        Duration::from_secs(600),
+        None,
+        Instant::ZERO,
+    );
+    iface.poll_maintenance(Instant::ZERO);
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(configured_router)
+        .unwrap();
+    assert_eq!(
+        iface.inner.route(&destination, Instant::ZERO),
+        Some(configured_router.into())
+    );
+
+    iface.inner.slaac.process_advertisement(
+        &learned_router,
+        Duration::from_secs(600),
+        None,
+        Instant::from_secs(1),
+    );
+    iface.poll_maintenance(Instant::from_secs(1));
+
+    // A lifetime-only refresh has no public metadata to update when RIO is
+    // disabled. Avoiding a remove-and-append keeps the application's later
+    // equal-prefix route in the same precedence position.
+    assert_eq!(
+        iface.inner.route(&destination, Instant::from_secs(1)),
+        Some(configured_router.into())
+    );
 }
 
 #[rstest]

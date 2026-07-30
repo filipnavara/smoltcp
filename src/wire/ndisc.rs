@@ -2,8 +2,6 @@ use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
-#[cfg(feature = "proto-ipv6-rio")]
-use crate::config::IFACE_MAX_ROUTE_COUNT;
 use crate::time::Duration;
 use crate::wire::Ipv6Address;
 use crate::wire::RawHardwareAddress;
@@ -225,107 +223,142 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
 
 /// Route Information options carried by a Router Advertisement.
 #[cfg(feature = "proto-ipv6-rio")]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct RouteInformationList {
-    entries: [Option<NdiscRouteInformation>; IFACE_MAX_ROUTE_COUNT],
+pub struct RouteInformationList<'a> {
+    source: RouteInformationSource<'a>,
+    buffer_len: usize,
 }
 
 #[cfg(feature = "proto-ipv6-rio")]
-impl RouteInformationList {
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+enum RouteInformationSource<'a> {
+    Empty,
+    Single(Option<NdiscRouteInformation>),
+    Reprs(&'a [NdiscRouteInformation]),
+    Options(&'a [u8]),
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl RouteInformationSource<'_> {
+    fn next(&mut self) -> Option<NdiscRouteInformation> {
+        loop {
+            match self {
+                Self::Empty => return None,
+                Self::Single(route_info) => return route_info.take(),
+                Self::Reprs(route_info) => {
+                    let (first, rest) = route_info.split_first()?;
+                    *route_info = rest;
+                    return Some(*first);
+                }
+                Self::Options(options) => {
+                    let current = *options;
+                    let option = NdiscOption::new_checked(current).ok()?;
+                    let option_len = option.data_len() as usize * 8;
+                    *options = &current[option_len..];
+
+                    if let Ok(NdiscOptionRepr::RouteInformation(route_info)) =
+                        NdiscOptionRepr::parse(&option)
+                        && route_info.is_valid_route_info()
+                    {
+                        return Some(route_info);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl<'a> RouteInformationList<'a> {
     /// Create an empty list.
     pub const fn new() -> Self {
         Self {
-            entries: [None; IFACE_MAX_ROUTE_COUNT],
+            source: RouteInformationSource::Empty,
+            buffer_len: 0,
         }
     }
 
-    /// Append an option to the list.
-    ///
-    /// A withdrawal or a higher-preference duplicate replaces the existing
-    /// entry, so emission never includes a duplicate prefix and prefix length.
-    /// Returns the option unchanged if it is invalid or cannot be retained
-    /// within the configured route capacity.
-    pub fn push(
-        &mut self,
-        route_info: NdiscRouteInformation,
-    ) -> core::result::Result<(), NdiscRouteInformation> {
-        if !route_info.is_valid_route_info() {
-            return Err(route_info);
-        }
-
-        let duplicate = self
-            .entries
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.same_prefix(&route_info)));
-        if let Some(index) = duplicate {
-            let existing = self.entries[index].unwrap();
-            let is_withdrawal = route_info.route_lifetime == Duration::ZERO;
-            let replaces_lower_preference = existing.route_lifetime != Duration::ZERO
-                && route_info.preference.rank() > existing.preference.rank();
-
-            // Emission canonicalizes reserved host bits, so replace the
-            // canonical duplicate in place rather than emitting both inputs.
-            if is_withdrawal || replaces_lower_preference {
-                self.entries[index] = Some(route_info);
-                return Ok(());
-            }
-            return Err(route_info);
-        }
-
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.is_none()) {
-            *entry = Some(route_info);
-            Ok(())
-        } else if route_info.route_lifetime == Duration::ZERO {
-            // A lost withdrawal can preserve a stale route indefinitely. When
-            // bounded storage is full, retain it ahead of the first update.
-            if let Some(entry) = self
-                .entries
-                .iter_mut()
-                .find(|entry| entry.is_some_and(|entry| entry.route_lifetime != Duration::ZERO))
-            {
-                *entry = Some(route_info);
-                Ok(())
-            } else {
-                Err(route_info)
-            }
-        } else {
-            Err(route_info)
+    fn from_options(options: &'a [u8], buffer_len: usize) -> Self {
+        Self {
+            source: RouteInformationSource::Options(options),
+            buffer_len,
         }
     }
 
     /// Iterate over the options in advertisement order.
     pub fn iter(&self) -> impl Iterator<Item = NdiscRouteInformation> + '_ {
-        self.entries.iter().flatten().copied()
+        let mut source = self.source;
+        core::iter::from_fn(move || source.next())
     }
 
     const fn buffer_len(&self) -> usize {
-        let mut len = 0;
-        let mut index = 0;
-        while index < IFACE_MAX_ROUTE_COUNT {
-            if let Some(route_info) = self.entries[index] {
-                len += NdiscOptionRepr::RouteInformation(route_info).buffer_len();
-            }
-            index += 1;
-        }
-        len
+        self.buffer_len
     }
 }
 
 #[cfg(feature = "proto-ipv6-rio")]
-impl Default for RouteInformationList {
+impl<'a> PartialEq for RouteInformationList<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl<'a> Eq for RouteInformationList<'a> {}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl<'a> Default for RouteInformationList<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[cfg(feature = "proto-ipv6-rio")]
-impl From<NdiscRouteInformation> for RouteInformationList {
-    fn from(route_info: NdiscRouteInformation) -> Self {
-        let mut list = Self::new();
-        list.push(route_info)
-            .expect("invalid Route Information option");
-        list
+impl<'a> TryFrom<NdiscRouteInformation> for RouteInformationList<'a> {
+    type Error = NdiscRouteInformation;
+
+    fn try_from(route_info: NdiscRouteInformation) -> core::result::Result<Self, Self::Error> {
+        if !route_info.is_valid_route_info() {
+            return Err(route_info);
+        }
+
+        Ok(Self {
+            source: RouteInformationSource::Single(Some(route_info)),
+            buffer_len: NdiscOptionRepr::RouteInformation(route_info).buffer_len(),
+        })
+    }
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl<'a> TryFrom<&'a [NdiscRouteInformation]> for RouteInformationList<'a> {
+    type Error = NdiscRouteInformation;
+
+    fn try_from(
+        route_info: &'a [NdiscRouteInformation],
+    ) -> core::result::Result<Self, Self::Error> {
+        let mut buffer_len = 0;
+        for (index, entry) in route_info.iter().enumerate() {
+            if !entry.is_valid_route_info() {
+                return Err(*entry);
+            }
+            if route_info[..index]
+                .iter()
+                .any(|previous| previous.same_prefix(entry))
+            {
+                // RFC 4191 forbids a sender from putting duplicate prefixes
+                // in one RA. Reject the representation rather than choosing
+                // which update wins; retention remains the receiver's policy.
+                return Err(*entry);
+            }
+            buffer_len += NdiscOptionRepr::RouteInformation(*entry).buffer_len();
+        }
+
+        Ok(Self {
+            source: RouteInformationSource::Reprs(route_info),
+            buffer_len,
+        })
     }
 }
 
@@ -348,7 +381,7 @@ pub enum Repr<'a> {
         mtu: Option<u32>,
         prefix_info: Option<NdiscPrefixInformation>,
         #[cfg(feature = "proto-ipv6-rio")]
-        route_info: RouteInformationList,
+        route_info: RouteInformationList<'a>,
     },
     NeighborSolicit {
         target_addr: Ipv6Address,
@@ -380,7 +413,7 @@ impl<'a> Repr<'a> {
         let (mut src_ll_addr, mut mtu, mut prefix_info, mut target_ll_addr, mut redirected_hdr) =
             (None, None, None, None, None);
         #[cfg(feature = "proto-ipv6-rio")]
-        let mut route_info = RouteInformationList::new();
+        let mut route_info_buffer_len = 0;
 
         let mut offset = 0;
         while packet.payload().len() > offset {
@@ -395,8 +428,11 @@ impl<'a> Repr<'a> {
                     NdiscOptionRepr::RedirectedHeader(redirect) => redirected_hdr = Some(redirect),
                     NdiscOptionRepr::Mtu(m) => mtu = Some(m),
                     #[cfg(feature = "proto-ipv6-rio")]
-                    NdiscOptionRepr::RouteInformation(info) if info.is_valid_route_info() => {
-                        let _ = route_info.push(info);
+                    NdiscOptionRepr::RouteInformation(info) => {
+                        if info.is_valid_route_info() {
+                            route_info_buffer_len +=
+                                NdiscOptionRepr::RouteInformation(info).buffer_len();
+                        }
                     }
                     _ => {}
                 }
@@ -408,6 +444,14 @@ impl<'a> Repr<'a> {
             }
             offset += len;
         }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        // Retain the packet bytes instead of copying RIOs into a
+        // route-capacity-sized array. The consumer can then apply its one
+        // bounded retention policy without the wire layer dropping options
+        // first.
+        let route_info =
+            RouteInformationList::from_options(packet.payload(), route_info_buffer_len);
 
         match packet.msg_type() {
             Message::RouterSolicit => Ok(Repr::RouterSolicit {
@@ -882,6 +926,99 @@ mod test {
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
+    fn test_router_advert_ignores_reserved_route_preference() {
+        let mut bytes = [0; 48];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_msg_type(Message::RouterAdvert);
+        packet.set_msg_code(0);
+        packet.set_current_hop_limit(64);
+        packet.set_router_flags(RouterFlags::MANAGED);
+        packet.set_router_preference(NdiscRoutePreference::High);
+        packet.set_router_lifetime(Duration::from_secs(900));
+
+        // Both RIOs are structurally valid. RFC 4191 requires the first one's
+        // reserved preference (10) to be ignored without hiding the valid RIO
+        // that follows it.
+        packet.payload_mut()[..16].copy_from_slice(&[
+            0x18, 0x02, 0x40, 0x10, 0x00, 0x00, 0x07, 0x08, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01,
+            0x00, 0x00,
+        ]);
+        packet.payload_mut()[16..32].copy_from_slice(&[
+            0x18, 0x02, 0x40, 0x08, 0x00, 0x00, 0x07, 0x08, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02,
+            0x00, 0x00,
+        ]);
+
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let Repr::RouterAdvert { route_info, .. } = Repr::parse(&packet).unwrap() else {
+            panic!("expected router advertisement");
+        };
+        assert!(route_info.iter().eq([NdiscRouteInformation {
+            prefix_len: 64,
+            preference: NdiscRoutePreference::High,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::new(0x2001, 0x0db8, 0x0002, 0, 0, 0, 0, 0),
+        }]));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_router_advert_preserves_all_route_info() {
+        const ORDINARY_ROUTE_COUNT: usize = 5;
+        let mut bytes = [0; 16 + ORDINARY_ROUTE_COUNT * 16 + 8];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_msg_type(Message::RouterAdvert);
+        packet.set_msg_code(0);
+        packet.set_router_preference(NdiscRoutePreference::Low);
+        packet.set_router_lifetime(Duration::from_secs(900));
+
+        let mut offset = 0;
+        for index in 0..ORDINARY_ROUTE_COUNT {
+            let route_lifetime = if index == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(1200)
+            };
+            let route = NdiscOptionRepr::RouteInformation(NdiscRouteInformation {
+                prefix_len: 64,
+                preference: NdiscRoutePreference::Medium,
+                route_lifetime,
+                prefix: Ipv6Address::new(0x2001, 0xdb8, index as u16, 0, 0, 0, 0, 0),
+            });
+            let len = route.buffer_len();
+            let mut option =
+                NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..offset + len]);
+            route.emit(&mut option);
+            offset += len;
+        }
+
+        // Keep the body default last to verify that parsing is independent of
+        // both option order and the host's configured route-table capacity.
+        let default = NdiscRouteInformation {
+            prefix_len: 0,
+            preference: NdiscRoutePreference::High,
+            route_lifetime: Duration::from_secs(1800),
+            prefix: Ipv6Address::UNSPECIFIED,
+        };
+        let route = NdiscOptionRepr::RouteInformation(default);
+        let len = route.buffer_len();
+        let mut option =
+            NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..offset + len]);
+        route.emit(&mut option);
+
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let Repr::RouterAdvert { route_info, .. } = Repr::parse(&packet).unwrap() else {
+            panic!("expected router advertisement");
+        };
+        assert_eq!(route_info.iter().count(), ORDINARY_ROUTE_COUNT + 1);
+        assert!(route_info.iter().any(|route| route == default));
+        assert!(route_info.iter().any(|route| {
+            route.route_lifetime == Duration::ZERO
+                && route.prefix == Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)
+        }));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_router_advert_multiple_route_info() {
         use crate::wire::{NdiscRouteInformation, NdiscRoutePreference};
 
@@ -897,8 +1034,8 @@ mod test {
             route_lifetime: Duration::from_secs(900),
             prefix: Ipv6Address::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0xff00),
         };
-        let mut route_info = RouteInformationList::from(first);
-        route_info.push(second).unwrap();
+        let route_info_entries = [first, second];
+        let route_info = RouteInformationList::try_from(route_info_entries.as_slice()).unwrap();
         let repr = Icmpv6Repr::Ndisc(Repr::RouterAdvert {
             hop_limit: 64,
             flags: RouterFlags::empty(),
@@ -934,71 +1071,48 @@ mod test {
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
-    fn test_route_information_list_validation_and_replacement() {
+    fn test_route_information_list_validation() {
         let base = NdiscRouteInformation {
             prefix_len: 53,
             preference: NdiscRoutePreference::Low,
             route_lifetime: Duration::from_secs(900),
             prefix: Ipv6Address::new(0x2001, 0xdb8, 1, 0xa800, 0, 0, 0, 1),
         };
-        let mut list = RouteInformationList::from(base);
-
-        let higher_duplicate = NdiscRouteInformation {
-            preference: NdiscRoutePreference::High,
-            prefix: Ipv6Address::new(0x2001, 0xdb8, 1, 0xafff, 0, 0, 0, 2),
+        let distinct = NdiscRouteInformation {
+            prefix: Ipv6Address::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0),
             ..base
         };
-        assert_eq!(list.push(higher_duplicate), Ok(()));
-        assert_eq!(list.iter().count(), 1);
-        assert_eq!(list.iter().next(), Some(higher_duplicate));
-
-        let lower_duplicate = NdiscRouteInformation {
-            preference: NdiscRoutePreference::Medium,
-            ..base
-        };
-        assert_eq!(list.push(lower_duplicate), Err(lower_duplicate));
-
-        let withdrawal = NdiscRouteInformation {
-            route_lifetime: Duration::ZERO,
-            ..base
-        };
-        assert_eq!(list.push(withdrawal), Ok(()));
-        assert_eq!(list.iter().next(), Some(withdrawal));
+        let entries = [base, distinct];
+        let list = RouteInformationList::try_from(entries.as_slice()).unwrap();
+        assert!(list.iter().eq(entries));
 
         let invalid_prefix = NdiscRouteInformation {
             prefix_len: 129,
             ..base
         };
-        assert_eq!(list.push(invalid_prefix), Err(invalid_prefix));
+        assert_eq!(
+            RouteInformationList::try_from(invalid_prefix),
+            Err(invalid_prefix)
+        );
         let invalid_preference = NdiscRouteInformation {
             preference: NdiscRoutePreference::Unknown(2),
             ..base
         };
-        assert_eq!(list.push(invalid_preference), Err(invalid_preference));
-    }
+        assert_eq!(
+            RouteInformationList::try_from(invalid_preference),
+            Err(invalid_preference)
+        );
 
-    #[test]
-    #[cfg(feature = "proto-ipv6-rio")]
-    fn test_route_information_list_retains_withdrawal_when_full() {
-        let route = |index, lifetime| NdiscRouteInformation {
-            prefix_len: 64,
-            preference: NdiscRoutePreference::Medium,
-            route_lifetime: lifetime,
-            prefix: Ipv6Address::new(0x2001, 0xdb8, index, 0, 0, 0, 0, 0),
+        let duplicate = NdiscRouteInformation {
+            preference: NdiscRoutePreference::High,
+            // Host bits differ, but the canonical /53 is the same.
+            prefix: Ipv6Address::new(0x2001, 0xdb8, 1, 0xafff, 0, 0, 0, 2),
+            ..base
         };
-        let mut list = RouteInformationList::new();
-        for index in 1..=IFACE_MAX_ROUTE_COUNT as u16 {
-            list.push(route(index, Duration::from_secs(900))).unwrap();
-        }
-
-        let withdrawal = route(0xff, Duration::ZERO);
-        assert_eq!(list.push(withdrawal), Ok(()));
-        assert_eq!(list.iter().count(), IFACE_MAX_ROUTE_COUNT);
-        assert_eq!(list.iter().next(), Some(withdrawal));
-        assert!(
-            !list
-                .iter()
-                .any(|entry| entry.prefix == route(1, Duration::ZERO).prefix)
+        let entries = [base, duplicate];
+        assert_eq!(
+            RouteInformationList::try_from(entries.as_slice()),
+            Err(duplicate)
         );
     }
 }

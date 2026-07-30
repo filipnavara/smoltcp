@@ -1,9 +1,14 @@
 #![deny(missing_docs)]
+#[cfg(feature = "proto-ipv6-rio")]
+use core::cmp::{Ordering, Reverse};
+
 use heapless::{LinearMap, Vec};
 
 use crate::config::{IFACE_MAX_PREFIX_COUNT, IFACE_MAX_ROUTE_COUNT};
 #[cfg(feature = "proto-ipv6-rio")]
-use crate::iface::Route as InterfaceRoute;
+use crate::iface::route::LearnedRoute;
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::iface::{Route as InterfaceRoute, Routes};
 use crate::time::{Duration, Instant};
 use crate::wire::NdiscPrefixInfoFlags;
 #[cfg(all(feature = "proto-ipv6-rio", test))]
@@ -16,15 +21,20 @@ const MAX_RTR_SOLICITATIONS: u8 = 3;
 const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
 const IPV6_DEFAULT: Ipv6Cidr = Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0);
 
-// One RA can contribute the header default plus the configured number of
-// RIOs. Keeping two routers per prefix is the minimum bounded representation
-// that can preserve RFC 4191 failover instead of discarding the first backup.
 #[cfg(feature = "proto-ipv6-rio")]
-const SLAAC_ROUTE_PREFIX_COUNT: usize = IFACE_MAX_ROUTE_COUNT + 1;
-#[cfg(feature = "proto-ipv6-rio")]
-const SLAAC_ROUTE_CANDIDATE_COUNT: usize = SLAAC_ROUTE_PREFIX_COUNT * 2;
+/// Maximum number of learned routes retained for RFC 4191 selection.
+///
+/// Learned candidates share the interface's documented route bound. A
+/// resource limit must not become a hidden second routing table merely because
+/// RIO selection needs to retain alternate routers.
+pub(crate) const SLAAC_ROUTE_CANDIDATE_COUNT: usize = IFACE_MAX_ROUTE_COUNT;
 #[cfg(not(feature = "proto-ipv6-rio"))]
 const SLAAC_ROUTE_CANDIDATE_COUNT: usize = IFACE_MAX_ROUTE_COUNT;
+
+#[cfg(feature = "proto-ipv6-rio")]
+type RouteValidUntil = Option<Instant>;
+#[cfg(not(feature = "proto-ipv6-rio"))]
+type RouteValidUntil = Instant;
 
 /// Router solicitation state machine
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,32 +52,33 @@ pub(crate) struct Route {
     pub cidr: Ipv6Cidr,
     /// Router, origin of the advertisement
     pub via_router: Ipv6Address,
-    /// Valid lifetime of the route; `None` represents the RFC 4191 infinity
-    /// sentinel.
-    pub valid_until: Option<Instant>,
+    /// Valid lifetime of the route.
+    ///
+    /// With RFC 4191 support, `None` represents the infinite-lifetime sentinel.
+    pub valid_until: RouteValidUntil,
     /// Preference advertised for the route.
     #[cfg(feature = "proto-ipv6-rio")]
     pub preference: NdiscRoutePreference,
-}
-
-/// A route mirrored into the public interface route table by SLAAC.
-///
-/// Tracking ownership separately prevents a withdrawal from deleting a
-/// matching route that was installed by the application.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct InstalledRoute {
-    pub cidr: Ipv6Cidr,
-    pub via_router: Ipv6Address,
-    pub valid_until: Option<Instant>,
+    /// Stable arrival order used to break equal-rank RFC 4191 ties.
+    #[cfg(feature = "proto-ipv6-rio")]
+    order: u32,
 }
 
 /// Result of merging configured and RFC 4191 routes for forwarding.
 #[cfg(feature = "proto-ipv6-rio")]
+#[derive(Clone, Copy)]
 pub(crate) struct RouteSelection {
     /// Next hop selected for the packet.
     pub(crate) next_hop: Option<IpAddress>,
-    /// Preferable unreachable routers that should receive recovery probes.
-    pub(crate) skipped_routers: Vec<Ipv6Address, SLAAC_ROUTE_CANDIDATE_COUNT>,
+    selected: Option<SelectedRoute>,
+    selected_is_unreachable: bool,
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+#[derive(Clone, Copy)]
+enum SelectedRoute {
+    Configured(InterfaceRoute),
+    Learned(LearnedRoute),
 }
 
 /// Info associated with a prefix
@@ -102,53 +113,53 @@ impl PrefixInfo {
 
 impl Route {
     /// Compare this route based on the prefix and the next hop router.
+    #[cfg(any(test, not(feature = "proto-ipv6-rio")))]
     pub fn same_route(&self, cidr: &Ipv6Cidr, via_router: &Ipv6Address) -> bool {
         self.cidr == *cidr && self.via_router == *via_router
     }
 
     /// Get whether the route is still valid.
     pub fn is_valid(&self, now: Instant) -> bool {
-        self.valid_until.is_none_or(|valid_until| valid_until > now)
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            self.valid_until.is_none_or(|valid_until| valid_until > now)
+        }
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        {
+            self.valid_until > now
+        }
     }
 
     #[cfg(feature = "proto-ipv6-rio")]
     fn preference_rank(&self) -> i8 {
-        match self.preference {
-            NdiscRoutePreference::Low => -1,
-            NdiscRoutePreference::Medium => 0,
-            NdiscRoutePreference::High => 1,
-            NdiscRoutePreference::Unknown(_) => -2,
-        }
+        self.preference.rank()
     }
 
-    #[cfg(not(feature = "proto-ipv6-rio"))]
-    fn preference_rank(&self) -> i8 {
-        0
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn identity_cmp(&self, other: &Self) -> Ordering {
+        (self.cidr, self.via_router).cmp(&(other.cidr, other.via_router))
     }
 
-    /// Get whether this route should be synchronized to the interface.
-    ///
-    /// When identical prefixes are advertised by multiple routers, only
-    /// routes with the highest advertised preference are active.
-    #[cfg(all(test, feature = "proto-ipv6-rio"))]
-    pub fn is_active(&self, routes: &[Route], now: Instant) -> bool {
-        if !self.is_valid(now) {
-            return false;
-        }
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn is_withdrawn(&self) -> bool {
+        // `take_route_order` rebases before this value can be assigned, so it
+        // is available as an in-place tombstone without stealing an Instant
+        // value that could be a legitimate lifetime deadline.
+        self.order == u32::MAX
+    }
 
-        #[cfg(feature = "proto-ipv6-rio")]
-        if routes.iter().any(|route| {
-            route.is_valid(now)
-                && route.cidr == self.cidr
-                && route.preference_rank() > self.preference_rank()
-        }) {
-            return false;
-        }
-
-        #[cfg(not(feature = "proto-ipv6-rio"))]
-        let _ = routes;
-
-        true
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn usefulness_cmp(&self, other: &Self) -> Ordering {
+        (
+            self.cidr.prefix_len(),
+            self.preference_rank(),
+            Reverse(self.order),
+        )
+            .cmp(&(
+                other.cidr.prefix_len(),
+                other.preference_rank(),
+                Reverse(other.order),
+            ))
     }
 }
 
@@ -164,8 +175,6 @@ pub struct Slaac {
     prefix: LinearMap<Ipv6Cidr, PrefixInfo, IFACE_MAX_PREFIX_COUNT>,
     /// Set of routes received.
     routes: Vec<Route, SLAAC_ROUTE_CANDIDATE_COUNT>,
-    /// Routes currently mirrored into `Interface::routes`.
-    installed_routes: Vec<InstalledRoute, IFACE_MAX_ROUTE_COUNT>,
     /// Router discovery phase.
     phase: Phase,
     /// Signal for address and route updates.
@@ -174,6 +183,9 @@ pub struct Slaac {
     retry_rs_at: Instant,
     /// Number of solicitations emitted.
     num_solicitations: u8,
+    /// Monotonic tie breaker for learned routes.
+    #[cfg(feature = "proto-ipv6-rio")]
+    next_route_order: u32,
 }
 
 impl Slaac {
@@ -181,11 +193,12 @@ impl Slaac {
         Self {
             prefix: LinearMap::new(),
             routes: Vec::new(),
-            installed_routes: Vec::new(),
             phase: Phase::Start,
             sync_required: false,
             retry_rs_at: Instant::from_millis(0),
             num_solicitations: MAX_RTR_SOLICITATIONS,
+            #[cfg(feature = "proto-ipv6-rio")]
+            next_route_order: 0,
         }
     }
 
@@ -203,32 +216,79 @@ impl Slaac {
     }
 
     /// Get a reference to the set of routes stored.
-    #[cfg(test)]
+    #[cfg(any(test, not(feature = "proto-ipv6-rio")))]
     pub(crate) fn routes(&self) -> &Vec<Route, SLAAC_ROUTE_CANDIDATE_COUNT> {
         &self.routes
     }
 
-    /// Get the SLAAC-owned routes mirrored into the public route table.
-    pub(crate) fn installed_routes(&self) -> &Vec<InstalledRoute, IFACE_MAX_ROUTE_COUNT> {
-        &self.installed_routes
-    }
-
-    /// Replace the set of routes mirrored into the public route table.
-    pub(crate) fn set_installed_routes(
-        &mut self,
-        installed_routes: Vec<InstalledRoute, IFACE_MAX_ROUTE_COUNT>,
-    ) {
-        self.installed_routes = installed_routes;
-    }
-
-    /// Return whether a public route is one previously installed by SLAAC.
+    /// Return the number of retained learned-route candidates.
     #[cfg(feature = "proto-ipv6-rio")]
-    pub(crate) fn owns_interface_route(&self, route: &InterfaceRoute) -> bool {
-        self.installed_routes.iter().any(|installed| {
-            route.cidr == installed.cidr.into()
-                && route.via_router == installed.via_router.into()
-                && route.expires_at == installed.valid_until
+    pub(crate) fn learned_route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Return one valid learned-route candidate for public-table reconciliation.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn learned_route_at(&self, index: usize, now: Instant) -> Option<LearnedRoute> {
+        let route = *self.routes.get(index)?;
+        route.is_valid(now).then_some(LearnedRoute {
+            cidr: route.cidr,
+            via_router: route.via_router,
+            valid_until: route.valid_until,
+            preference: route.preference,
+            // Reconciliation temporarily reorders candidates by
+            // usefulness, so the vector index cannot represent arrival order.
+            order: route.order,
         })
+    }
+
+    /// Sort learned candidates from most to least useful.
+    ///
+    /// Public-route reconciliation can consume candidates in this order
+    /// without allocating another capacity-sized collection. Call
+    /// [`Self::restore_learned_route_identity_order`] before processing more
+    /// advertisements.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn sort_learned_routes_by_usefulness(&mut self) {
+        self.routes.sort_unstable_by(|left, right| {
+            right
+                .usefulness_cmp(left)
+                .then_with(|| left.identity_cmp(right))
+        });
+    }
+
+    /// Restore the identity order used by linear admission and lookup.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn restore_learned_route_identity_order(&mut self) {
+        self.routes
+            .sort_unstable_by(|left, right| left.identity_cmp(right));
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn take_route_order(&mut self) -> u32 {
+        if self.next_route_order == u32::MAX {
+            // An arrival counter must not wrap and make a new route look
+            // older than retained routes. Rebase the bounded set while
+            // preserving its relative arrival order.
+            self.routes.sort_unstable_by_key(|route| route.order);
+            let mut order = 0;
+            for route in self.routes.iter_mut() {
+                if !route.is_withdrawn() {
+                    route.order = order;
+                    order = order
+                        .checked_add(1)
+                        .expect("learned route capacity fits in u32");
+                }
+            }
+            self.restore_learned_route_identity_order();
+            self.next_route_order = order;
+        }
+
+        let order = self.next_route_order;
+        self.next_route_order = order
+            .checked_add(1)
+            .expect("rebased learned route order must have room");
+        order
     }
 
     fn add_prefix(&mut self, cidr: &Ipv6Cidr, prefix: &NdiscPrefixInformation, now: Instant) {
@@ -251,13 +311,109 @@ impl Slaac {
         }
     }
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn route_identity_index(
+        &self,
+        cidr: &Ipv6Cidr,
+        via_router: &Ipv6Address,
+    ) -> Result<usize, usize> {
+        self.routes.binary_search_by(|candidate| {
+            (candidate.cidr, candidate.via_router).cmp(&(*cidr, *via_router))
+        })
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn insert_route_by_identity(&mut self, route: Route) {
+        let index = self
+            .route_identity_index(&route.cidr, &route.via_router)
+            .expect_err("learned route identity must be unique");
+        self.routes
+            .insert(index, route)
+            .expect("learned-route admission established a free slot");
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn remove_withdrawn_routes(&mut self) {
+        self.routes.retain(|route| !route.is_withdrawn());
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn replace_route_by_identity(&mut self, index: usize, route: Route) {
+        self.routes.remove(index);
+        self.insert_route_by_identity(route);
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn less_useful_index(&self, current: Option<usize>, candidate: usize) -> Option<usize> {
+        match current {
+            Some(current)
+                if self.routes[current].usefulness_cmp(&self.routes[candidate])
+                    != Ordering::Greater =>
+            {
+                Some(current)
+            }
+            _ => Some(candidate),
+        }
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn full_route_victim(&self, incoming: &Route) -> Option<usize> {
+        let mut prefix_present = false;
+        let mut worst = None;
+        let mut worst_coverage_preserving = None;
+        let mut group_start = 0;
+
+        while group_start < self.routes.len() {
+            let group_cidr = self.routes[group_start].cidr;
+            let mut group_end = group_start + 1;
+            while group_end < self.routes.len() && self.routes[group_end].cidr == group_cidr {
+                group_end += 1;
+            }
+
+            let is_incoming_prefix = group_cidr == incoming.cidr;
+            prefix_present |= is_incoming_prefix;
+            let group_is_redundant = group_end - group_start > 1;
+
+            for index in group_start..group_end {
+                worst = self.less_useful_index(worst, index);
+                if group_is_redundant || is_incoming_prefix {
+                    // Removing a member of a repeated group preserves its
+                    // prefix. The incoming route likewise preserves its own
+                    // prefix when replacing that group's only member.
+                    worst_coverage_preserving =
+                        self.less_useful_index(worst_coverage_preserving, index);
+                }
+            }
+            group_start = group_end;
+        }
+
+        if let Some(victim) = worst_coverage_preserving {
+            if !prefix_present {
+                // A new prefix adds forwarding coverage, so it gets a
+                // redundant slot before any covered prefix is discarded.
+                return Some(victim);
+            }
+
+            // The incoming route is another path to an existing prefix. Keep
+            // it only when it improves the least useful removable fallback.
+            return (incoming.usefulness_cmp(&self.routes[victim]) == Ordering::Greater)
+                .then_some(victim);
+        }
+
+        let victim = worst?;
+        // With one route per prefix, admission must trade one coverage set for
+        // another. RFC 4191 lookup usefulness decides whether that is a gain.
+        (incoming.usefulness_cmp(&self.routes[victim]) == Ordering::Greater).then_some(victim)
+    }
+
     fn add_route(
         &mut self,
         cidr: &Ipv6Cidr,
         router: &Ipv6Address,
         #[cfg(feature = "proto-ipv6-rio")] preference: NdiscRoutePreference,
-        valid_until: Option<Instant>,
+        valid_until: RouteValidUntil,
     ) {
+        #[cfg(feature = "proto-ipv6-rio")]
         if IFACE_MAX_ROUTE_COUNT == 0 {
             // A zero route capacity is an explicit request to disable route
             // storage. Do not retain hidden RFC 4191 candidates that could
@@ -265,23 +421,44 @@ impl Slaac {
             return;
         }
 
-        if let Some(route) = self.routes.iter_mut().find(|r| r.same_route(cidr, router)) {
-            #[cfg(feature = "proto-ipv6-rio")]
-            let changed = route.valid_until != valid_until || route.preference != preference;
-            #[cfg(not(feature = "proto-ipv6-rio"))]
-            let changed = route.valid_until != valid_until;
+        #[cfg(feature = "proto-ipv6-rio")]
+        if let Ok(index) = self.route_identity_index(cidr, router) {
+            let was_withdrawn = self.routes[index].is_withdrawn();
+            let refreshed_order = was_withdrawn.then(|| self.take_route_order());
+            let route = &mut self.routes[index];
+            let changed =
+                was_withdrawn || route.valid_until != valid_until || route.preference != preference;
             route.valid_until = valid_until;
-            #[cfg(feature = "proto-ipv6-rio")]
-            {
-                route.preference = preference;
+            route.preference = preference;
+            if let Some(order) = refreshed_order {
+                // A withdrawal followed by a duplicate positive RIO is a new
+                // arrival, matching the previous remove-then-insert flow.
+                route.order = order;
             }
             if changed {
-                // The public mirror carries the learned expiry, so refreshing
-                // a lifetime must replace that entry even when its next hop
-                // and preference did not change.
+                // The RIO public mirror carries the learned expiry, so a
+                // refresh must replace that exact owned entry.
                 self.sync_required = true;
             }
             return;
+        }
+
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        if let Some(route) = self.routes.iter_mut().find(|r| r.same_route(cidr, router)) {
+            // The legacy mirror has no expiry metadata. Refreshing only this
+            // internal deadline must not remove and reappend the public route,
+            // which would change equal-prefix tie order.
+            route.valid_until = valid_until;
+            return;
+        }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if self.routes.iter().any(Route::is_withdrawn) {
+            // Withdrawals stay as tombstones until the whole RA has been
+            // scanned, avoiding one compaction per option. A later distinct
+            // insertion needs those logical free slots now, so compact the
+            // entire batch once before applying normal admission.
+            self.remove_withdrawn_routes();
         }
 
         let route = Route {
@@ -290,328 +467,251 @@ impl Slaac {
             valid_until,
             #[cfg(feature = "proto-ipv6-rio")]
             preference,
+            #[cfg(feature = "proto-ipv6-rio")]
+            order: self.take_route_order(),
         };
 
         #[cfg(not(feature = "proto-ipv6-rio"))]
-        if self.routes.push(route).is_ok() {
+        {
+            // Preserve the legacy notification even when bounded storage
+            // rejects a newly advertised route. Existing callers synchronize
+            // after every new-route attempt, not only successful insertions.
+            let _ = self.routes.push(route);
             self.sync_required = true;
         }
 
         #[cfg(feature = "proto-ipv6-rio")]
         {
-            const ROUTERS_PER_PREFIX: usize = 2;
-
-            let same_prefix_count = self
-                .routes
-                .iter()
-                .filter(|candidate| candidate.cidr == *cidr)
-                .count();
-
-            if same_prefix_count == ROUTERS_PER_PREFIX {
-                let worst = self
-                    .routes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.cidr == *cidr)
-                    .min_by_key(|(_, candidate)| candidate.preference_rank())
-                    .map(|(index, _)| index)
-                    .unwrap();
-
-                // A bounded table must retain the more useful fallback. Equal
-                // preference keeps arrival order deterministic.
-                if route.preference_rank() > self.routes[worst].preference_rank() {
-                    self.routes[worst] = route;
-                    self.sync_required = true;
-                }
-                return;
-            }
-
-            let prefix_is_known = same_prefix_count != 0;
-            let prefix_count = self
-                .routes
-                .iter()
-                .enumerate()
-                .filter(|(index, candidate)| {
-                    self.routes[..*index]
-                        .iter()
-                        .all(|earlier| earlier.cidr != candidate.cidr)
-                })
-                .count();
-
-            if prefix_is_known || prefix_count < SLAAC_ROUTE_PREFIX_COUNT {
-                self.routes
-                    .push(route)
-                    .expect("SLAAC candidate capacity matches its prefix policy");
+            if !self.routes.is_full() {
+                // Every same-prefix router is a usable fallback. The
+                // documented total route bound is the only limit while space
+                // remains; a per-prefix cap would silently discard reachability.
+                self.insert_route_by_identity(route);
                 self.sync_required = true;
                 return;
             }
 
-            let worst_prefix = self
-                .routes
-                .iter()
-                .enumerate()
-                .filter(|(index, candidate)| {
-                    self.routes[..*index]
-                        .iter()
-                        .all(|earlier| earlier.cidr != candidate.cidr)
-                })
-                .min_by(|(_, left), (_, right)| {
-                    let left_rank = self
-                        .routes
-                        .iter()
-                        .filter(|candidate| candidate.cidr == left.cidr)
-                        .map(Route::preference_rank)
-                        .max()
-                        .unwrap();
-                    let right_rank = self
-                        .routes
-                        .iter()
-                        .filter(|candidate| candidate.cidr == right.cidr)
-                        .map(Route::preference_rank)
-                        .max()
-                        .unwrap();
-                    (left.cidr.prefix_len(), left_rank).cmp(&(right.cidr.prefix_len(), right_rank))
-                })
-                .map(|(_, route)| route.cidr)
-                .unwrap();
-            let worst_rank = self
-                .routes
-                .iter()
-                .filter(|candidate| candidate.cidr == worst_prefix)
-                .map(Route::preference_rank)
-                .max()
-                .unwrap();
-
-            // Prefer retaining more-specific prefixes because RFC 4191 route
-            // lookup ranks prefix length before preference.
-            if (route.cidr.prefix_len(), route.preference_rank())
-                > (worst_prefix.prefix_len(), worst_rank)
-            {
-                self.routes
-                    .retain(|candidate| candidate.cidr != worst_prefix);
-                self.routes
-                    .push(route)
-                    .expect("removing one prefix leaves candidate capacity");
+            // Identity ordering makes equal-prefix routes adjacent, so this
+            // admission scan detects redundant groups in O(C) time.
+            if let Some(victim) = self.full_route_victim(&route) {
+                self.replace_route_by_identity(victim, route);
                 self.sync_required = true;
             }
         }
     }
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn expire_route(&mut self, cidr: &Ipv6Cidr, via_router: &Ipv6Address) -> bool {
+        let Ok(index) = self.route_identity_index(cidr, via_router) else {
+            return false;
+        };
+        if self.routes[index].is_withdrawn() {
+            return false;
+        }
+
+        // Marking an exact binary-searched entry makes R withdrawals
+        // O(R log C). `process_advertisement` compacts all marks in one O(C)
+        // pass after later duplicate RIOs have had a chance to revive them.
+        self.routes[index].order = u32::MAX;
+        self.sync_required = true;
+        true
+    }
+
+    #[cfg(not(feature = "proto-ipv6-rio"))]
     fn expire_route(&mut self, cidr: &Ipv6Cidr, via_router: &Ipv6Address) {
-        let previous_len = self.routes.len();
-
-        // Remove withdrawals immediately because `None` is reserved to mean
-        // an infinite lifetime, not an expired candidate.
-        self.routes
-            .retain(|route| !route.same_route(cidr, via_router));
-        if self.routes.len() != previous_len {
-            self.sync_required = true;
+        for route in self.routes.iter_mut() {
+            if route.same_route(cidr, via_router) {
+                // Keep the legacy tombstone until synchronization so the
+                // interface can identify which mirrored route to remove.
+                route.valid_until = Instant::ZERO;
+                self.sync_required = true;
+            }
         }
     }
 
-    /// Select the bounded set mirrored into the public route table.
-    pub(crate) fn selected_routes(&self, now: Instant) -> Vec<Route, IFACE_MAX_ROUTE_COUNT> {
-        let mut selected: Vec<Route, IFACE_MAX_ROUTE_COUNT> = Vec::new();
-
-        for route in self.routes.iter().filter(|route| route.is_valid(now)) {
-            #[cfg(feature = "proto-ipv6-rio")]
-            if let Some(existing) = selected
-                .iter_mut()
-                .find(|existing| existing.cidr == route.cidr)
-            {
-                if route.preference_rank() > existing.preference_rank() {
-                    *existing = *route;
-                }
-                continue;
-            }
-
-            if selected.push(*route).is_ok() {
-                continue;
-            }
-
-            let Some(worst) = selected
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, candidate)| {
-                    (candidate.cidr.prefix_len(), candidate.preference_rank())
-                })
-                .map(|(index, _)| index)
-            else {
-                // `Vec<_, 0>` rejects every push. Keeping this branch benign
-                // makes a zero configured route capacity mean "learn none".
-                continue;
-            };
-            if (route.cidr.prefix_len(), route.preference_rank())
-                > (
-                    selected[worst].cidr.prefix_len(),
-                    selected[worst].preference_rank(),
-                )
-            {
-                selected[worst] = *route;
-            }
-        }
-
-        // Synchronization tries the most useful entries first if application
-        // routes leave fewer free slots than the configured SLAAC capacity.
-        selected.sort_unstable_by(|left, right| {
-            (right.cidr.prefix_len(), right.preference_rank())
-                .cmp(&(left.cidr.prefix_len(), left.preference_rank()))
-        });
-        selected
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn learned_route_is_valid(route: LearnedRoute, now: Instant) -> bool {
+        route
+            .valid_until
+            .is_none_or(|valid_until| valid_until > now)
     }
 
-    /// Find the RFC 4191 route for a destination.
-    #[cfg(all(feature = "proto-ipv6-rio", test))]
-    pub(crate) fn lookup_route<F>(
-        &self,
-        destination: &Ipv6Address,
-        now: Instant,
-        is_unreachable: F,
-    ) -> Option<Route>
-    where
-        F: FnMut(&Ipv6Address) -> bool,
-    {
-        let (best, best_reachable, _) = self.route_candidates(destination, now, is_unreachable);
-        best_reachable.or(best)
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn learned_route_is_better(candidate: LearnedRoute, current: LearnedRoute) -> bool {
+        let candidate_rank = (candidate.cidr.prefix_len(), candidate.preference.rank());
+        let current_rank = (current.cidr.prefix_len(), current.preference.rank());
+        candidate_rank > current_rank
+            || (candidate_rank == current_rank && candidate.order < current.order)
     }
 
     #[cfg(feature = "proto-ipv6-rio")]
     fn route_candidates<F>(
-        &self,
+        routes: &Routes,
         destination: &Ipv6Address,
         now: Instant,
         mut is_unreachable: F,
     ) -> (
-        Option<Route>,
-        Option<Route>,
-        Vec<Route, SLAAC_ROUTE_CANDIDATE_COUNT>,
+        Option<InterfaceRoute>,
+        Option<LearnedRoute>,
+        Option<LearnedRoute>,
     )
     where
         F: FnMut(&Ipv6Address) -> bool,
     {
-        if IFACE_MAX_ROUTE_COUNT == 0 {
-            return (None, None, Vec::new());
-        }
+        let destination = IpAddress::Ipv6(*destination);
+        let mut configured = None;
+        let mut best_learned = None;
+        let mut best_reachable_learned = None;
 
-        let mut best = None;
-        let mut best_reachable = None;
-        let mut unreachable_routes = Vec::new();
-
-        for route in self
-            .routes
-            .iter()
-            .filter(|route| route.is_valid(now) && route.cidr.contains_addr(destination))
-        {
-            let better_than = |current: Option<Route>| {
-                current.is_none_or(|current| {
-                    (route.cidr.prefix_len(), route.preference_rank())
-                        > (current.cidr.prefix_len(), current.preference_rank())
-                })
+        for route in routes.iter().filter(|route| {
+            route.cidr.contains_addr(&destination)
+                && route.expires_at.is_none_or(|expires_at| now <= expires_at)
+        }) {
+            let Some(learned) = routes.learned(route) else {
+                // Match Routes::lookup's last-wins behavior for equal-prefix
+                // configured entries. Learned entries are ranked separately.
+                if configured.is_none_or(|current: InterfaceRoute| {
+                    route.cidr.prefix_len() >= current.cidr.prefix_len()
+                }) {
+                    configured = Some(*route);
+                }
+                continue;
             };
-
-            if better_than(best) {
-                best = Some(*route);
+            if !Self::learned_route_is_valid(learned, now) {
+                continue;
             }
-            if is_unreachable(&route.via_router) {
-                unreachable_routes
-                    .push(*route)
-                    .expect("matching routes are bounded by route candidates");
-            } else if better_than(best_reachable) {
-                best_reachable = Some(*route);
+
+            if best_learned.is_none_or(|current| Self::learned_route_is_better(learned, current)) {
+                best_learned = Some(learned);
+            }
+            if !is_unreachable(&learned.via_router)
+                && best_reachable_learned
+                    .is_none_or(|current| Self::learned_route_is_better(learned, current))
+            {
+                best_reachable_learned = Some(learned);
             }
         }
 
-        (best, best_reachable, unreachable_routes)
+        (configured, best_learned, best_reachable_learned)
     }
 
-    /// Merge a configured route with learned routes and identify recovery probes.
+    /// Select a route from the authoritative public route table.
     #[cfg(feature = "proto-ipv6-rio")]
-    pub(crate) fn lookup_route_with_configured<F>(
+    pub(crate) fn lookup_route<F>(
         &self,
+        routes: &Routes,
         destination: &Ipv6Address,
         now: Instant,
-        configured: Option<InterfaceRoute>,
-        mut is_unreachable: F,
+        is_unreachable: F,
     ) -> RouteSelection
     where
         F: FnMut(&Ipv6Address) -> bool,
     {
-        #[derive(Clone, Copy)]
-        enum Candidate {
-            Configured(InterfaceRoute),
-            Advertised(Route),
-        }
+        let (configured, best_learned, best_reachable_learned) =
+            Self::route_candidates(routes, destination, now, is_unreachable);
 
-        fn choose(
-            configured: Option<InterfaceRoute>,
-            advertised: Option<Route>,
-        ) -> Option<Candidate> {
-            match (configured, advertised) {
-                (Some(configured), Some(advertised))
-                    if advertised.cidr.prefix_len() > configured.cidr.prefix_len() =>
-                {
-                    Some(Candidate::Advertised(advertised))
-                }
-                (Some(configured), _) => Some(Candidate::Configured(configured)),
-                (None, Some(advertised)) => Some(Candidate::Advertised(advertised)),
-                (None, None) => None,
+        let selected_reachable = match (configured, best_reachable_learned) {
+            (Some(configured), Some(learned))
+                if learned.cidr.prefix_len() > configured.cidr.prefix_len() =>
+            {
+                Some(SelectedRoute::Learned(learned))
             }
-        }
+            (Some(configured), _) => Some(SelectedRoute::Configured(configured)),
+            (None, Some(learned)) => Some(SelectedRoute::Learned(learned)),
+            (None, None) => None,
+        };
 
-        let (best, best_reachable, unreachable_routes) =
-            self.route_candidates(destination, now, &mut is_unreachable);
-
-        // Configured routes must take part before the all-unreachable fallback
-        // is chosen. Otherwise an unreachable learned /64 could incorrectly
-        // hide a usable configured default route. They remain administrator-
-        // owned and are not suppressed by learned-router reachability state.
-        let selected_reachable = choose(configured, best_reachable);
-        let selected_is_unreachable = selected_reachable.is_none();
-        let selected = selected_reachable.or_else(|| choose(configured, best));
-        let mut skipped_routers = Vec::new();
-
-        if let Some(selected) = selected {
-            for route in unreachable_routes {
-                let (same_router, route_is_preferable) = match selected {
-                    Candidate::Configured(selected) => (
-                        selected.via_router == route.via_router.into(),
-                        // A configured route intentionally wins an equal-prefix
-                        // tie, so only a longer learned prefix was skipped.
-                        route.cidr.prefix_len() > selected.cidr.prefix_len(),
-                    ),
-                    Candidate::Advertised(selected) => (
-                        selected.via_router == route.via_router,
-                        (route.cidr.prefix_len(), route.preference_rank())
-                            > (selected.cidr.prefix_len(), selected.preference_rank()),
-                    ),
-                };
-                if !same_router
-                    && (selected_is_unreachable || route_is_preferable)
-                    && !skipped_routers.contains(&route.via_router)
-                {
-                    skipped_routers
-                        .push(route.via_router)
-                        .expect("skipped routers are bounded by route candidates");
-                }
-            }
-        }
+        // An installed configured route is usable independently of
+        // neighbor-unreachability state. Only fall back to an unreachable
+        // learned router when the public table has no matching configured or
+        // reachable learned entry.
+        let selected_is_unreachable = selected_reachable.is_none() && best_learned.is_some();
+        let selected = selected_reachable.or_else(|| best_learned.map(SelectedRoute::Learned));
 
         let next_hop = selected.map(|selected| match selected {
-            Candidate::Configured(route) => route.via_router,
-            Candidate::Advertised(route) => route.via_router.into(),
+            SelectedRoute::Configured(route) => route.via_router,
+            SelectedRoute::Learned(route) => route.via_router.into(),
         });
         RouteSelection {
             next_hop,
-            skipped_routers,
+            selected,
+            selected_is_unreachable,
         }
     }
 
-    /// Return whether an address is a currently valid learned router.
     #[cfg(feature = "proto-ipv6-rio")]
-    pub(crate) fn is_router(&self, address: &Ipv6Address, now: Instant) -> bool {
-        self.routes
+    fn is_recovery_probe_candidate(selection: RouteSelection, route: LearnedRoute) -> bool {
+        let Some(selected) = selection.selected else {
+            return false;
+        };
+        let (same_router, route_is_preferable) = match selected {
+            SelectedRoute::Configured(selected) => (
+                selected.via_router == route.via_router.into(),
+                // A configured route intentionally wins an equal-prefix tie,
+                // so only a longer learned prefix was skipped.
+                route.cidr.prefix_len() > selected.cidr.prefix_len(),
+            ),
+            SelectedRoute::Learned(selected) => {
+                let rank = (route.cidr.prefix_len(), route.preference.rank());
+                let selected_rank = (selected.cidr.prefix_len(), selected.preference.rank());
+                (
+                    selected.via_router == route.via_router,
+                    rank > selected_rank || (rank == selected_rank && route.order < selected.order),
+                )
+            }
+        };
+        !same_router && (selection.selected_is_unreachable || route_is_preferable)
+    }
+
+    /// Iterate over routes whose routers may need an RFC 4191 recovery probe.
+    ///
+    /// The caller filters by current reachability and coalesces repeated
+    /// routers. Yielding one entry per matching route keeps this scan linear;
+    /// de-duplicating here would rescan every earlier route on packet egress.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn recovery_probe_candidates<'a>(
+        &'a self,
+        routes: &'a Routes,
+        destination: &Ipv6Address,
+        now: Instant,
+        selection: RouteSelection,
+    ) -> impl Iterator<Item = Ipv6Address> + 'a {
+        let destination = IpAddress::Ipv6(*destination);
+        routes.iter().filter_map(move |route| {
+            let learned = routes.learned(route)?;
+            (Self::learned_route_is_valid(learned, now)
+                    && route.cidr.contains_addr(&destination)
+                    // Equal-ranked routes retain arrival order. An
+                    // unreachable route before the selected fallback would
+                    // have won if reachable and still needs a recovery probe.
+                    && Self::is_recovery_probe_candidate(selection, learned))
+            .then_some(learned.via_router)
+        })
+    }
+
+    /// Remove every learned route through a node that is no longer a router.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn remove_router(&mut self, address: &Ipv6Address) -> bool {
+        let old_len = self.routes.len();
+        self.routes.retain(|route| route.via_router != *address);
+        let removed = self.routes.len() != old_len;
+        if removed {
+            // RFC 4861 requires routing decisions through a node to be
+            // invalidated as soon as an accepted NA clears its Router flag.
+            // Signal maintenance as a fallback even though the receive path
+            // also reconciles immediately before any queued packet is sent.
+            self.sync_required = true;
+        }
+        removed
+    }
+
+    /// Return whether an address is a valid learned router in the public table.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn is_router(&self, routes: &Routes, address: &Ipv6Address, now: Instant) -> bool {
+        routes
             .iter()
-            .any(|route| route.is_valid(now) && route.via_router == *address)
+            .filter_map(|route| routes.learned(route))
+            .any(|route| Self::learned_route_is_valid(route, now) && route.via_router == *address)
     }
 
     fn process_prefix(&mut self, prefix: NdiscPrefixInformation, now: Instant) {
@@ -635,9 +735,12 @@ impl Slaac {
         router_lifetime: Duration, // default route lifetime
         #[cfg(feature = "proto-ipv6-rio")] router_preference: NdiscRoutePreference,
         prefix: Option<NdiscPrefixInformation>, // prefix info
-        #[cfg(feature = "proto-ipv6-rio")] route_info: NdiscRouteInformationList, // route info
+        #[cfg(feature = "proto-ipv6-rio")] route_info: NdiscRouteInformationList<'_>, // route info
         now: Instant,
     ) {
+        #[cfg(feature = "proto-ipv6-rio")]
+        let mut has_withdrawn_routes = false;
+
         if let Some(prefix) = prefix
             && prefix.is_valid_prefix_info()
         {
@@ -645,22 +748,28 @@ impl Slaac {
         }
 
         if router_lifetime > Duration::ZERO {
+            #[cfg(feature = "proto-ipv6-rio")]
             self.add_route(
                 &IPV6_DEFAULT,
                 source,
-                #[cfg(feature = "proto-ipv6-rio")]
                 router_preference,
                 Some(now + router_lifetime),
             );
+            #[cfg(not(feature = "proto-ipv6-rio"))]
+            self.add_route(&IPV6_DEFAULT, source, now + router_lifetime);
         } else {
+            #[cfg(feature = "proto-ipv6-rio")]
+            {
+                has_withdrawn_routes |= self.expire_route(&IPV6_DEFAULT, source);
+            }
+            #[cfg(not(feature = "proto-ipv6-rio"))]
             self.expire_route(&IPV6_DEFAULT, source);
         }
 
         #[cfg(feature = "proto-ipv6-rio")]
-        for route_info in route_info
-            .iter()
-            .filter(|route_info| route_info.is_valid_route_info())
-        {
+        for route_info in route_info.iter() {
+            // Parsed lists lazily yield only wire-valid RIOs. Avoid repeating
+            // wire-level policy in the SLAAC state machine.
             let cidr = Ipv6Cidr::new(route_info.prefix, route_info.prefix_len);
             if route_info.route_lifetime > Duration::ZERO {
                 let valid_until = if route_info.has_infinite_lifetime() {
@@ -670,8 +779,15 @@ impl Slaac {
                 };
                 self.add_route(&cidr, source, route_info.preference, valid_until);
             } else {
-                self.expire_route(&cidr, source);
+                has_withdrawn_routes |= self.expire_route(&cidr, source);
             }
+        }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if has_withdrawn_routes {
+            // One stable compaction avoids repeatedly shifting the bounded
+            // identity-sorted vector for every withdrawn RIO in this RA.
+            self.remove_withdrawn_routes();
         }
 
         // Advertisement might be unsolicited
@@ -747,6 +863,7 @@ impl Slaac {
 
     /// Get the next time the SLAAC state must be polled for updates.
     pub(crate) fn poll_at(&self, now: Instant) -> Option<Instant> {
+        #[cfg(feature = "proto-ipv6-rio")]
         if self.sync_required(now) {
             // A received RA changes forwarding state before any lifetime
             // deadline, so users of split polling must be woken immediately.
@@ -763,10 +880,17 @@ impl Slaac {
                         None
                     }
                 });
+                #[cfg(feature = "proto-ipv6-rio")]
                 let routes_at = self
                     .routes
                     .iter()
                     .filter_map(|r| if r.is_valid(now) { r.valid_until } else { None });
+                #[cfg(not(feature = "proto-ipv6-rio"))]
+                let routes_at = self.routes.iter().filter_map(|r| {
+                    // Legacy routes always have a finite deadline, so keep the
+                    // compact Instant representation and its original timing.
+                    r.is_valid(now).then_some(r.valid_until)
+                });
                 prefix_at.chain(routes_at).min()
             }
             _ => None,
@@ -777,6 +901,11 @@ impl Slaac {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "proto-ipv6-rio")]
+    use crate::wire::{
+        Icmpv6Message, Icmpv6Packet, NdiscOption, NdiscOptionRepr, NdiscRepr, NdiscRouterFlags,
+    };
+
     mod mock {
         use super::super::*;
         pub const SOURCE: Ipv6Address = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 0);
@@ -796,9 +925,14 @@ mod test {
         pub const ROUTE: Route = Route {
             cidr: Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0),
             via_router: SOURCE,
+            #[cfg(feature = "proto-ipv6-rio")]
             valid_until: Some(Instant::from_millis_const(100000)),
+            #[cfg(not(feature = "proto-ipv6-rio"))]
+            valid_until: Instant::from_millis_const(100000),
             #[cfg(feature = "proto-ipv6-rio")]
             preference: crate::wire::NdiscRoutePreference::Medium,
+            #[cfg(feature = "proto-ipv6-rio")]
+            order: 0,
         };
 
         #[cfg(feature = "proto-ipv6-rio")]
@@ -810,6 +944,55 @@ mod test {
         };
     }
     use mock::*;
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn route_info_list(route: NdiscRouteInformation) -> NdiscRouteInformationList<'static> {
+        NdiscRouteInformationList::try_from(route).unwrap()
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn parsed_route_info<'a>(
+        bytes: &'a mut [u8],
+        entries: &[NdiscRouteInformation],
+    ) -> NdiscRouteInformationList<'a> {
+        {
+            let mut packet = Icmpv6Packet::new_unchecked(&mut *bytes);
+            packet.set_msg_type(Icmpv6Message::RouterAdvert);
+            packet.set_msg_code(0);
+            packet.set_router_flags(NdiscRouterFlags::empty());
+            packet.set_router_preference(NdiscRoutePreference::Medium);
+            packet.set_router_lifetime(Duration::ZERO);
+
+            let mut offset = 0;
+            for entry in entries {
+                let repr = NdiscOptionRepr::RouteInformation(*entry);
+                let len = repr.buffer_len();
+                let mut option =
+                    NdiscOption::new_unchecked(&mut packet.payload_mut()[offset..offset + len]);
+                repr.emit(&mut option);
+                offset += len;
+            }
+            assert_eq!(offset, packet.payload_mut().len());
+        }
+
+        let packet = Icmpv6Packet::new_unchecked(&*bytes);
+        let NdiscRepr::RouterAdvert { route_info, .. } = NdiscRepr::parse(&packet).unwrap() else {
+            panic!("expected router advertisement");
+        };
+        route_info
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn reconcile_routes(slaac: &mut Slaac, routes: &mut Routes, now: Instant) {
+        // Production reconciliation admits the most useful candidates
+        // first without allocating a second capacity-sized vector, then
+        // restores the identity grouping required by advertisement admission.
+        slaac.sort_learned_routes_by_usefulness();
+        routes.reconcile_learned(slaac.learned_route_count(), |index| {
+            slaac.learned_route_at(index, now)
+        });
+        slaac.restore_learned_route_identity_order();
+    }
 
     #[test]
     fn test_route() {
@@ -899,7 +1082,10 @@ mod test {
             now,
         );
         assert_eq!(slaac.phase, Phase::Maintaining);
+        #[cfg(feature = "proto-ipv6-rio")]
         assert_eq!(slaac.poll_at(now), Some(now));
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        assert_eq!(slaac.poll_at(now), Some(now + VALID));
 
         for (prefix, info) in slaac.prefix() {
             assert_eq!(prefix.address(), PREFIX.prefix);
@@ -912,7 +1098,10 @@ mod test {
         for route in slaac.routes() {
             assert_eq!(route.cidr, Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
             assert_eq!(route.via_router, SOURCE);
+            #[cfg(feature = "proto-ipv6-rio")]
             assert_eq!(route.valid_until, Some(now + VALID));
+            #[cfg(not(feature = "proto-ipv6-rio"))]
+            assert_eq!(route.valid_until, now + VALID);
             assert!(route.is_valid(now));
         }
         assert_eq!(slaac.prefix().len(), 1);
@@ -945,8 +1134,18 @@ mod test {
         for (_prefix, info) in slaac.prefix() {
             assert!(!info.is_valid(now));
         }
-        // Expiry itself is an immediate synchronization deadline.
-        assert_eq!(slaac.poll_at(now), Some(now));
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            // RIO wakes split pollers immediately so route selection cannot
+            // keep using an expired learned candidate.
+            assert_eq!(slaac.poll_at(now), Some(now));
+        }
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        {
+            // Preserve the legacy feature-off contract: once every stored
+            // deadline is expired, there is no later timer to report.
+            assert_eq!(slaac.poll_at(now), None);
+        }
         slaac.update_slaac_state(now);
         assert!(!slaac.sync_required(now));
         assert_eq!(slaac.routes().len(), 0);
@@ -1023,8 +1222,17 @@ mod test {
             now,
         );
         assert!(slaac.sync_required(now));
-        assert!(slaac.routes().is_empty());
-        assert_eq!(slaac.poll_at(now), Some(now));
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            assert!(slaac.routes().is_empty());
+            assert_eq!(slaac.poll_at(now), Some(now));
+        }
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        {
+            assert_eq!(slaac.routes().len(), 1);
+            assert!(!slaac.routes()[0].is_valid(now));
+            assert_eq!(slaac.poll_at(now), None);
+        }
 
         slaac.update_slaac_state(now);
         assert_eq!(slaac.prefix().len(), 0);
@@ -1048,7 +1256,7 @@ mod test {
             VALID,
             NdiscRoutePreference::Medium,
             None,
-            ROUTE_INFO.into(),
+            route_info_list(ROUTE_INFO),
             now,
         );
         assert_eq!(slaac.routes().len(), 2);
@@ -1066,7 +1274,7 @@ mod test {
             VALID,
             NdiscRoutePreference::Medium,
             None,
-            expire.into(),
+            route_info_list(expire),
             now,
         );
         assert!(slaac.routes().iter().all(|route| route.cidr != cidr));
@@ -1090,8 +1298,9 @@ mod test {
         let now = Instant::from_millis(1);
         let mut second = ROUTE_INFO;
         second.prefix = Ipv6Address::new(0xfd00, 0xdb8, 1, 0, 0, 0, 0, 0);
-        let mut route_info = NdiscRouteInformationList::from(ROUTE_INFO);
-        route_info.push(second).unwrap();
+        let route_info_entries = [ROUTE_INFO, second];
+        let route_info =
+            NdiscRouteInformationList::try_from(route_info_entries.as_slice()).unwrap();
 
         slaac.process_advertisement(
             &SOURCE,
@@ -1120,6 +1329,125 @@ mod test {
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
+    fn test_duplicate_route_info_preserves_sequential_semantics() {
+        let now = Instant::from_millis(1);
+        let destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut medium = ROUTE_INFO;
+        medium.preference = NdiscRoutePreference::Medium;
+        let mut slaac = Slaac::new();
+
+        for source in [SOURCE, SOURCE_2] {
+            slaac.process_advertisement(
+                &source,
+                Duration::ZERO,
+                NdiscRoutePreference::Medium,
+                None,
+                route_info_list(medium),
+                now,
+            );
+        }
+
+        let mut withdrawn = medium;
+        withdrawn.route_lifetime = Duration::ZERO;
+        let mut bytes = [0; 48];
+        let route_info = parsed_route_info(&mut bytes, &[withdrawn, medium]);
+        assert_eq!(route_info.iter().count(), 2);
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info,
+            now,
+        );
+
+        // The later positive duplicate revives the route as a new
+        // arrival. The untouched equal-rank router must therefore win the
+        // stable arrival-order tie.
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        assert_eq!(
+            slaac
+                .lookup_route(&routes, &destination, now, |_| false)
+                .next_hop,
+            Some(SOURCE_2.into())
+        );
+
+        let mut bytes = [0; 48];
+        let route_info = parsed_route_info(&mut bytes, &[medium, withdrawn]);
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info,
+            now,
+        );
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .all(|route| route.via_router != SOURCE)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_withdrawal_batch_frees_capacity_for_later_options() {
+        let now = Instant::from_millis(1);
+        let valid_until = Some(now + VALID);
+        let prefix = |index| Ipv6Address::new(0x2001, 0xdb8, index, 0, 0, 0, 0, 0);
+        let route = |index, lifetime| NdiscRouteInformation {
+            prefix_len: 64,
+            preference: NdiscRoutePreference::Medium,
+            route_lifetime: lifetime,
+            prefix: prefix(index),
+        };
+        let mut slaac = Slaac::new();
+
+        for index in 0..4 {
+            slaac.add_route(
+                &Ipv6Cidr::new(prefix(index), 64),
+                &SOURCE,
+                NdiscRoutePreference::Medium,
+                valid_until,
+            );
+        }
+        let entries = [
+            route(0, Duration::ZERO),
+            route(1, Duration::ZERO),
+            route(4, VALID),
+            route(5, VALID),
+        ];
+        let route_info = NdiscRouteInformationList::try_from(entries.as_slice()).unwrap();
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info,
+            now,
+        );
+
+        assert_eq!(slaac.routes().len(), IFACE_MAX_ROUTE_COUNT);
+        for index in [2, 3, 4, 5] {
+            assert!(
+                slaac
+                    .routes()
+                    .iter()
+                    .any(|candidate| candidate.cidr.address() == prefix(index))
+            );
+        }
+        assert!(
+            slaac
+                .routes()
+                .windows(2)
+                .all(|pair| pair[0].identity_cmp(&pair[1]) == Ordering::Less)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
     fn test_default_route_info_overrides_header() {
         let now = Instant::from_millis(1);
         let route_info = NdiscRouteInformation {
@@ -1135,7 +1463,7 @@ mod test {
             VALID,
             NdiscRoutePreference::Medium,
             None,
-            route_info.into(),
+            route_info_list(route_info),
             now,
         );
 
@@ -1151,49 +1479,10 @@ mod test {
             VALID,
             NdiscRoutePreference::Medium,
             None,
-            withdrawn.into(),
+            route_info_list(withdrawn),
             now,
         );
         assert!(slaac.routes().is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "proto-ipv6-rio")]
-    fn test_route_preference_selects_best_router() {
-        let now = Instant::from_millis(1);
-        let mut slaac = Slaac::new();
-        let mut low = ROUTE_INFO;
-        low.preference = NdiscRoutePreference::Low;
-
-        slaac.process_advertisement(
-            &SOURCE,
-            Duration::ZERO,
-            NdiscRoutePreference::Medium,
-            None,
-            ROUTE_INFO.into(),
-            now,
-        );
-        slaac.process_advertisement(
-            &SOURCE_2,
-            Duration::ZERO,
-            NdiscRoutePreference::Medium,
-            None,
-            low.into(),
-            now,
-        );
-
-        let high_route = slaac
-            .routes()
-            .iter()
-            .find(|route| route.via_router == SOURCE)
-            .unwrap();
-        let low_route = slaac
-            .routes()
-            .iter()
-            .find(|route| route.via_router == SOURCE_2)
-            .unwrap();
-        assert!(high_route.is_active(slaac.routes().as_slice(), now));
-        assert!(!low_route.is_active(slaac.routes().as_slice(), now));
     }
 
     #[test]
@@ -1219,10 +1508,71 @@ mod test {
             now,
         );
 
-        let selected = slaac.selected_routes(now);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].via_router, SOURCE_2);
-        assert_eq!(selected[0].preference, NdiscRoutePreference::High);
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        let selection = slaac.lookup_route(
+            &routes,
+            &Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            now,
+            |_| false,
+        );
+        assert_eq!(selection.next_hop, Some(SOURCE_2.into()));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_configured_route_wins_equal_prefix_but_not_longer_learned_prefix() {
+        let now = Instant::from_millis(1);
+        let destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let learned_cidr = Ipv6Cidr::new(ROUTE_INFO.prefix, ROUTE_INFO.prefix_len);
+        let mut slaac = Slaac::new();
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info_list(ROUTE_INFO),
+            now,
+        );
+
+        let configured = |cidr: Ipv6Cidr| InterfaceRoute {
+            cidr: cidr.into(),
+            via_router: SOURCE_3.into(),
+            preferred_until: None,
+            expires_at: None,
+        };
+
+        let mut equal_routes = Routes::new();
+        equal_routes.update(|storage| storage.push(configured(learned_cidr)).unwrap());
+        reconcile_routes(&mut slaac, &mut equal_routes, now);
+        assert_eq!(
+            slaac
+                .lookup_route(&equal_routes, &destination, now, |_| false)
+                .next_hop,
+            Some(SOURCE_3.into())
+        );
+
+        let mut less_specific_routes = Routes::new();
+        less_specific_routes.update(|storage| {
+            storage
+                .push(configured(Ipv6Cidr::new(ROUTE_INFO.prefix, 48)))
+                .unwrap()
+        });
+        reconcile_routes(&mut slaac, &mut less_specific_routes, now);
+        assert_eq!(
+            slaac
+                .lookup_route(&less_specific_routes, &destination, now, |_| false)
+                .next_hop,
+            Some(SOURCE.into())
+        );
+        assert_eq!(
+            slaac
+                .lookup_route(&less_specific_routes, &destination, now, |router| {
+                    *router == SOURCE
+                })
+                .next_hop,
+            Some(SOURCE_3.into())
+        );
     }
 
     #[test]
@@ -1239,7 +1589,7 @@ mod test {
             Duration::ZERO,
             NdiscRoutePreference::Medium,
             None,
-            ROUTE_INFO.into(),
+            route_info_list(ROUTE_INFO),
             now,
         );
         slaac.process_advertisement(
@@ -1247,7 +1597,7 @@ mod test {
             Duration::ZERO,
             NdiscRoutePreference::Medium,
             None,
-            low.into(),
+            route_info_list(low),
             now,
         );
         slaac.process_advertisement(
@@ -1259,42 +1609,82 @@ mod test {
             now,
         );
 
-        let lookup = |unreachable: &[Ipv6Address]| {
-            slaac
-                .lookup_route(&destination, now, |router| unreachable.contains(router))
-                .unwrap()
-                .via_router
-        };
-        assert_eq!(lookup(&[]), SOURCE);
-        assert_eq!(lookup(&[SOURCE]), SOURCE_2);
-        assert_eq!(lookup(&[SOURCE, SOURCE_2]), SOURCE_3);
-        assert_eq!(lookup(&[SOURCE, SOURCE_2, SOURCE_3]), SOURCE);
-        assert_eq!(lookup(&[]), SOURCE);
-
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
         let selection = |unreachable: &[Ipv6Address]| {
-            slaac.lookup_route_with_configured(&destination, now, None, |router| {
+            slaac.lookup_route(&routes, &destination, now, |router| {
                 unreachable.contains(router)
             })
         };
+        assert_eq!(selection(&[]).next_hop, Some(SOURCE.into()));
         let fallback = selection(&[SOURCE]);
         assert_eq!(fallback.next_hop, Some(SOURCE_2.into()));
-        assert_eq!(fallback.skipped_routers.as_slice(), &[SOURCE]);
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, fallback)
+            .filter(|router| [SOURCE].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE]);
 
         let default = selection(&[SOURCE, SOURCE_2]);
         assert_eq!(default.next_hop, Some(SOURCE_3.into()));
-        assert_eq!(default.skipped_routers.as_slice(), &[SOURCE, SOURCE_2]);
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, default)
+            .filter(|router| [SOURCE, SOURCE_2].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE, SOURCE_2]);
 
         let all_unreachable = selection(&[SOURCE, SOURCE_2, SOURCE_3]);
         assert_eq!(all_unreachable.next_hop, Some(SOURCE.into()));
-        assert_eq!(
-            all_unreachable.skipped_routers.as_slice(),
-            &[SOURCE_2, SOURCE_3]
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, all_unreachable)
+            .filter(|router| [SOURCE, SOURCE_2, SOURCE_3].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE_2, SOURCE_3]);
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_equal_rank_recovery_preserves_selection_order() {
+        let now = Instant::from_millis(1);
+        let destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut slaac = Slaac::new();
+
+        for source in [SOURCE, SOURCE_2] {
+            slaac.process_advertisement(
+                &source,
+                Duration::ZERO,
+                NdiscRoutePreference::Medium,
+                None,
+                route_info_list(ROUTE_INFO),
+                now,
+            );
+        }
+
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        let first_unreachable =
+            slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE);
+        assert_eq!(first_unreachable.next_hop, Some(SOURCE_2.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, first_unreachable)
+                .eq([SOURCE])
+        );
+
+        let second_unreachable =
+            slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE_2);
+        assert_eq!(second_unreachable.next_hop, Some(SOURCE.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, second_unreachable)
+                .next()
+                .is_none()
         );
     }
 
     #[test]
     #[cfg(feature = "proto-ipv6-rio")]
-    fn test_candidate_capacity_keeps_better_backup() {
+    fn test_candidate_capacity_keeps_three_router_fallbacks() {
         let now = Instant::from_millis(1);
         let mut low = ROUTE_INFO;
         low.preference = NdiscRoutePreference::Low;
@@ -1302,26 +1692,293 @@ mod test {
         medium.preference = NdiscRoutePreference::Medium;
         let mut slaac = Slaac::new();
 
-        for (source, route) in [(SOURCE, low), (SOURCE_2, medium), (SOURCE_3, ROUTE_INFO)] {
+        for (source, route) in [(SOURCE_3, ROUTE_INFO), (SOURCE, low), (SOURCE_2, medium)] {
             slaac.process_advertisement(
                 &source,
                 Duration::ZERO,
                 NdiscRoutePreference::Medium,
                 None,
-                route.into(),
+                route_info_list(route),
                 now,
             );
         }
 
         let cidr = Ipv6Cidr::new(ROUTE_INFO.prefix, ROUTE_INFO.prefix_len);
-        let candidates: Vec<_, 2> = slaac
+        let candidates: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
             .routes()
             .iter()
             .filter(|route| route.cidr == cidr)
             .copied()
             .collect();
-        assert_eq!(candidates.len(), 2);
-        assert!(candidates.iter().all(|route| route.via_router != SOURCE));
+        // All three routers fit within the total route capacity. Keeping
+        // only two would lose the final reachable fallback for this prefix.
+        assert_eq!(candidates.len(), 3);
+
+        assert!(
+            slaac
+                .routes()
+                .windows(2)
+                .all(|pair| pair[0].identity_cmp(&pair[1]) == Ordering::Less)
+        );
+        slaac.sort_learned_routes_by_usefulness();
+        assert_eq!(
+            slaac
+                .routes()
+                .iter()
+                .map(|route| route.via_router)
+                .collect::<Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT>>()
+                .as_slice(),
+            &[SOURCE_3, SOURCE_2, SOURCE]
+        );
+        assert_eq!(
+            (0..3)
+                .map(|index| slaac.learned_route_at(index, now).unwrap().order)
+                .collect::<Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT>>()
+                .as_slice(),
+            &[0, 2, 1]
+        );
+        slaac.restore_learned_route_identity_order();
+
+        let destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        assert_eq!(
+            slaac
+                .lookup_route(&routes, &destination, now, |router| *router == SOURCE_3)
+                .next_hop,
+            Some(SOURCE_2.into())
+        );
+        assert_eq!(
+            slaac
+                .lookup_route(&routes, &destination, now, |router| {
+                    [SOURCE_3, SOURCE_2].contains(router)
+                })
+                .next_hop,
+            Some(SOURCE.into())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_candidate_storage_respects_total_route_capacity() {
+        assert_eq!(SLAAC_ROUTE_CANDIDATE_COUNT, IFACE_MAX_ROUTE_COUNT);
+
+        let now = Instant::from_millis(1);
+        let valid_until = Some(now + VALID);
+        let prefix =
+            |index| Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, index, 0, 0, 0, 0, 0), 64);
+        let source_4 = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 4);
+        let mut slaac = Slaac::new();
+
+        // Fill the explicit total bound while one prefix has a fallback.
+        slaac.add_route(&prefix(1), &SOURCE, NdiscRoutePreference::Low, valid_until);
+        slaac.add_route(
+            &prefix(1),
+            &SOURCE_2,
+            NdiscRoutePreference::High,
+            valid_until,
+        );
+        slaac.add_route(
+            &prefix(2),
+            &SOURCE_3,
+            NdiscRoutePreference::Medium,
+            valid_until,
+        );
+        slaac.add_route(
+            &prefix(3),
+            &source_4,
+            NdiscRoutePreference::Medium,
+            valid_until,
+        );
+        assert_eq!(slaac.routes().len(), IFACE_MAX_ROUTE_COUNT);
+
+        // A new prefix adds coverage, so a bounded table should spend
+        // the redundant slot before dropping any already covered prefix.
+        slaac.add_route(&prefix(4), &SOURCE, NdiscRoutePreference::Low, valid_until);
+        assert_eq!(slaac.routes().len(), IFACE_MAX_ROUTE_COUNT);
+        for index in 1..=4 {
+            assert!(
+                slaac
+                    .routes()
+                    .iter()
+                    .any(|route| route.cidr == prefix(index))
+            );
+        }
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .all(|route| route.cidr != prefix(1) || route.via_router == SOURCE_2)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_full_candidate_storage_keeps_better_fallbacks() {
+        let now = Instant::from_millis(1);
+        let valid_until = Some(now + VALID);
+        let prefix =
+            |index| Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, index, 0, 0, 0, 0, 0), 64);
+        let source_4 = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 4);
+        let source_5 = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 5);
+        let source_6 = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 6);
+        let mut slaac = Slaac::new();
+
+        slaac.add_route(&prefix(1), &SOURCE, NdiscRoutePreference::Low, valid_until);
+        slaac.add_route(
+            &prefix(1),
+            &SOURCE_2,
+            NdiscRoutePreference::Medium,
+            valid_until,
+        );
+        slaac.add_route(
+            &prefix(2),
+            &SOURCE_3,
+            NdiscRoutePreference::Low,
+            valid_until,
+        );
+        slaac.add_route(
+            &prefix(3),
+            &source_4,
+            NdiscRoutePreference::Low,
+            valid_until,
+        );
+
+        // A better same-prefix route replaces the least useful removable
+        // fallback without reducing prefix coverage.
+        slaac.add_route(
+            &prefix(1),
+            &source_5,
+            NdiscRoutePreference::High,
+            valid_until,
+        );
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .all(|route| route.via_router != SOURCE)
+        );
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .any(|route| route.via_router == source_5)
+        );
+
+        // A worse arrival cannot displace either retained fallback merely
+        // because the table happens to be full.
+        slaac.add_route(
+            &prefix(1),
+            &source_6,
+            NdiscRoutePreference::Low,
+            valid_until,
+        );
+        assert!(
+            slaac
+                .routes()
+                .iter()
+                .all(|route| route.via_router != source_6)
+        );
+        assert!(
+            slaac
+                .routes()
+                .windows(2)
+                .all(|pair| pair[0].identity_cmp(&pair[1]) == Ordering::Less)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_removed_public_learned_route_no_longer_affects_selection() {
+        let now = Instant::from_millis(1);
+        let mut slaac = Slaac::new();
+        let destination = Ipv6Address::new(0xfd00, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut low = ROUTE_INFO;
+        low.preference = NdiscRoutePreference::Low;
+
+        slaac.process_advertisement(
+            &SOURCE,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info_list(ROUTE_INFO),
+            now,
+        );
+        slaac.process_advertisement(
+            &SOURCE_2,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info_list(low),
+            now,
+        );
+
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        assert_eq!(
+            slaac
+                .lookup_route(&routes, &destination, now, |_| false)
+                .next_hop,
+            Some(SOURCE.into())
+        );
+
+        routes.update(|storage| {
+            let index = storage
+                .iter()
+                .position(|route| route.via_router == SOURCE.into())
+                .unwrap();
+            storage.remove(index);
+        });
+
+        // The public table is authoritative. A retained RA candidate
+        // must not remain a hidden forwarding or router-recovery source after
+        // the application removes its public learned entry.
+        assert_eq!(
+            slaac
+                .lookup_route(&routes, &destination, now, |_| false)
+                .next_hop,
+            Some(SOURCE_2.into())
+        );
+        assert!(!slaac.is_router(&routes, &SOURCE, now));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_recovery_candidates_leave_router_coalescing_to_caller() {
+        let now = Instant::from_millis(1);
+        let destination = Ipv6Address::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 1);
+        let mut slaac = Slaac::new();
+        let more_specific = Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 0), 64);
+        let less_specific = Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0), 48);
+
+        slaac.add_route(
+            &more_specific,
+            &SOURCE,
+            NdiscRoutePreference::High,
+            Some(now + VALID),
+        );
+        slaac.add_route(
+            &less_specific,
+            &SOURCE,
+            NdiscRoutePreference::High,
+            Some(now + VALID),
+        );
+        slaac.add_route(
+            &IPV6_DEFAULT,
+            &SOURCE_2,
+            NdiscRoutePreference::Medium,
+            Some(now + VALID),
+        );
+
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        let selection = slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE);
+        assert_eq!(selection.next_hop, Some(SOURCE_2.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, selection)
+                .eq([SOURCE, SOURCE])
+        );
     }
 
     #[test]
@@ -1337,7 +1994,7 @@ mod test {
             Duration::ZERO,
             NdiscRoutePreference::Medium,
             None,
-            route_info.into(),
+            route_info_list(route_info),
             now,
         );
 
@@ -1347,25 +2004,27 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "proto-ipv6-rio")]
-    fn test_ra_route_info_reserved_preference() {
-        let mut slaac = Slaac::new();
+    #[cfg(not(feature = "proto-ipv6-rio"))]
+    fn test_full_route_insertion_preserves_legacy_sync_notification() {
         let now = Instant::from_millis(1);
+        let valid_until = now + VALID;
+        let mut slaac = Slaac::new();
 
-        // Options with the reserved preference must be ignored (RFC 4191)
-        let mut reserved = ROUTE_INFO;
-        reserved.preference = crate::wire::NdiscRoutePreference::Unknown(2);
-        let mut route_info = NdiscRouteInformationList::new();
-        assert_eq!(route_info.push(reserved), Err(reserved));
-        slaac.process_advertisement(
-            &SOURCE,
-            Duration::ZERO,
-            NdiscRoutePreference::Medium,
-            None,
-            route_info,
-            now,
-        );
-        assert!(slaac.routes().is_empty());
-        assert!(!slaac.sync_required(now));
+        for index in 0..IFACE_MAX_ROUTE_COUNT {
+            let cidr = Ipv6Cidr::new(
+                Ipv6Address::new(0x2001, 0xdb8, index as u16, 0, 0, 0, 0, 0),
+                64,
+            );
+            slaac.add_route(&cidr, &SOURCE, valid_until);
+        }
+        slaac.update_slaac_state(now);
+        assert!(!slaac.has_ra_update());
+
+        let rejected = Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 0), 64);
+        slaac.add_route(&rejected, &SOURCE, valid_until);
+
+        assert_eq!(slaac.routes().len(), IFACE_MAX_ROUTE_COUNT);
+        assert!(!slaac.routes().iter().any(|route| route.cidr == rejected));
+        assert!(slaac.has_ra_update());
     }
 }

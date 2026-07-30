@@ -43,8 +43,6 @@ use super::socket_set::SocketSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT, IFACE_MAX_PREFIX_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
 };
-#[cfg(feature = "proto-ipv6-rio")]
-use crate::iface::Route;
 use crate::iface::Routes;
 #[cfg(feature = "proto-ipv6-slaac")]
 use crate::iface::Slaac;
@@ -120,6 +118,8 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
+    #[cfg(feature = "proto-ipv6-rio")]
+    router_probe_deferred: bool,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -261,6 +261,8 @@ impl Interface {
                 reassembly_timeout: Duration::from_secs(60),
             },
             fragmenter: Fragmenter::new(),
+            #[cfg(feature = "proto-ipv6-rio")]
+            router_probe_deferred: false,
             inner: InterfaceInner {
                 now,
                 caps,
@@ -490,11 +492,13 @@ impl Interface {
             }
         }
 
-        #[cfg(feature = "proto-ipv6-slaac")]
-        {
-            // Ingress can learn or withdraw routes. Synchronize before egress
-            // so this same poll never forwards with the previous RA state.
-            self.poll_maintenance(timestamp);
+        #[cfg(feature = "proto-ipv6-rio")]
+        if self.inner.slaac.has_ra_update() {
+            // The maintenance pass above already handled timer-driven work.
+            // In a RIO-enabled build, synchronize only an ingress-triggered
+            // RA update here so the same poll uses it without repeating
+            // unrelated maintenance.
+            self.sync_slaac_state(timestamp);
         }
 
         // Process egress.
@@ -540,13 +544,30 @@ impl Interface {
             self.ndisc_rs_egress(device);
         }
 
-        #[cfg(feature = "proto-ipv6-rio")]
-        self.ndisc_router_probe_egress(device);
-
         #[cfg(feature = "multicast")]
         self.multicast_egress(device);
 
-        self.socket_egress(device, sockets)
+        #[cfg(feature = "proto-ipv6-rio")]
+        let prioritize_router_probe = self.router_probe_deferred;
+        #[cfg(feature = "proto-ipv6-rio")]
+        if prioritize_router_probe {
+            // Normal egress had the first opportunity on the previous pass.
+            // Give a due probe that could not be sent one earlier attempt now
+            // so repeated normal traffic cannot starve router recovery.
+            self.router_probe_deferred = !self.ndisc_router_probe_egress(device);
+        }
+
+        let result = self.socket_egress(device, sockets);
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if !prioritize_router_probe {
+            // Recovery probes are advisory maintenance traffic, so try them
+            // after normal egress. A failed due attempt is remembered for one
+            // earlier opportunity on the next pass.
+            self.router_probe_deferred = !self.ndisc_router_probe_egress(device);
+        }
+
+        result
     }
 
     /// Process one incoming packet queued in the device.
@@ -628,11 +649,10 @@ impl Interface {
             any(feature = "medium-ethernet", feature = "medium-ieee802154")
         ))]
         {
-            res = res.min(
-                self.inner
-                    .neighbor_cache
-                    .router_resolution_poll_at(timestamp),
-            );
+            let (routes, neighbor_cache) = (&self.inner.routes, &mut self.inner.neighbor_cache);
+            neighbor_cache
+                .sync_router_resolutions(routes.revision(), routes.learned_router_addresses());
+            res = res.min(neighbor_cache.router_resolution_poll_at(timestamp));
         }
 
         res
@@ -1048,11 +1068,7 @@ impl InterfaceInner {
         #[cfg(feature = "proto-ipv6-rio")]
         let route = match addr {
             IpAddress::Ipv6(destination) => {
-                // SLAAC routes are mirrored for API visibility, but forwarding
-                // selects from every retained candidate so bounded public-table
-                // capacity cannot suppress RFC 4191 fallback.
-                self.rio_route_selection(addr, destination, timestamp)
-                    .next_hop
+                self.rio_route_selection(destination, timestamp).next_hop
             }
             #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => self.routes.lookup(addr, timestamp),
@@ -1063,22 +1079,17 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-ipv6-rio")]
-    fn inner_routes_without_slaac(&self, addr: &IpAddress, timestamp: Instant) -> Option<Route> {
-        self.routes.lookup_filtered(addr, timestamp, |route| {
-            !self.slaac.owns_interface_route(route)
-        })
-    }
-
-    #[cfg(feature = "proto-ipv6-rio")]
     fn rio_route_selection(
         &self,
-        addr: &IpAddress,
         destination: &Ipv6Address,
         timestamp: Instant,
     ) -> SlaacRouteSelection {
-        let configured = self.inner_routes_without_slaac(addr, timestamp);
+        // Only routes still present in the public table may influence
+        // forwarding. The Routes-owned sidecar classifies learned entries
+        // during this single scan, so application removals take effect
+        // immediately without a nested ownership lookup.
         self.slaac
-            .lookup_route_with_configured(destination, timestamp, configured, |router| {
+            .lookup_route(&self.routes, destination, timestamp, |router| {
                 match self.caps.medium {
                     #[cfg(feature = "medium-ethernet")]
                     Medium::Ethernet => {
@@ -1094,6 +1105,49 @@ impl InterfaceInner {
             })
     }
 
+    #[cfg(all(
+        feature = "proto-ipv6-rio",
+        any(feature = "medium-ethernet", feature = "medium-ieee802154")
+    ))]
+    fn router_probe_still_useful(
+        &self,
+        router: Ipv6Address,
+        destination: Ipv6Address,
+        timestamp: Instant,
+    ) -> bool {
+        let destination_addr = destination.into();
+        if self.in_same_network(&destination_addr) {
+            return false;
+        }
+        let selection = self.rio_route_selection(&destination, timestamp);
+        self.slaac
+            .recovery_probe_candidates(&self.routes, &destination, timestamp, selection)
+            .any(|candidate| candidate == router)
+    }
+
+    #[cfg(all(
+        feature = "proto-ipv6-rio",
+        any(feature = "medium-ethernet", feature = "medium-ieee802154")
+    ))]
+    fn request_recovery_probes(
+        &mut self,
+        destination: &Ipv6Address,
+        timestamp: Instant,
+        selection: SlaacRouteSelection,
+    ) -> bool {
+        let (routes, slaac, neighbor_cache) = (&self.routes, &self.slaac, &mut self.neighbor_cache);
+        let routes_revision = routes.revision();
+        neighbor_cache.sync_router_resolutions(routes_revision, routes.learned_router_addresses());
+        for router in slaac.recovery_probe_candidates(routes, destination, timestamp, selection) {
+            if neighbor_cache.is_router_unreachable(&router, timestamp)
+                && !neighbor_cache.request_router_probe(router, *destination, timestamp)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     #[cfg(feature = "proto-ipv6-rio")]
     fn route_with_rio_probes(&mut self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
         if self.in_same_network(addr) {
@@ -1107,13 +1161,18 @@ impl InterfaceInner {
         };
         #[cfg(not(feature = "proto-ipv4"))]
         let IpAddress::Ipv6(destination) = addr;
-        let selection = self.rio_route_selection(addr, destination, timestamp);
+        let selection = self.rio_route_selection(destination, timestamp);
 
-        // Useful traffic continues through the reachable fallback while
-        // RFC 4191 recovery probes are queued separately for the more
-        // desirable routers that route selection skipped.
-        for router in selection.skipped_routers {
-            self.neighbor_cache.request_router_probe(router, timestamp);
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        {
+            // One current useful-traffic witness per skipped router
+            // preserves probe authorization without retaining every
+            // destination or rescanning them when the bounded pool fills.
+            let retained = self.request_recovery_probes(destination, timestamp, selection);
+            debug_assert!(
+                retained,
+                "one-context-per-router bound must retain every skipped router"
+            );
         }
         selection.next_hop
     }
@@ -1282,13 +1341,23 @@ impl InterfaceInner {
 
         #[cfg(feature = "proto-ipv6-rio")]
         match dst_addr {
-            IpAddress::Ipv6(router) if self.slaac.is_router(&router, self.now) => {
-                // Count only solicitations actually dispatched to learned
-                // routers; failed sends and ordinary neighbor lookups are not
-                // evidence that an RFC 4191 next hop is unreachable.
-                self.neighbor_cache.record_router_probe(router, self.now);
+            IpAddress::Ipv6(neighbor) => {
+                // RIO-enabled NA processing discards packets without a live
+                // or incomplete target entry. Record only a solicitation that
+                // was actually dispatched so its response can complete
+                // resolution.
+                self.neighbor_cache
+                    .record_neighbor_probe(neighbor, self.now);
+
+                if self.slaac.is_router(&self.routes, &neighbor, self.now) {
+                    // Count only solicitations actually dispatched to learned
+                    // routers; failed sends and ordinary neighbor lookups are
+                    // not evidence that an RFC 4191 next hop is unreachable.
+                    self.neighbor_cache.record_router_probe(neighbor, self.now);
+                }
             }
-            _ => {}
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => {}
         }
 
         // The request got dispatched, limit the rate on the cache.
