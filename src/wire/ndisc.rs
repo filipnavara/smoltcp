@@ -589,18 +589,20 @@ impl<'a> Repr<'a> {
                 packet.set_msg_code(0);
                 packet.set_current_hop_limit(hop_limit);
                 packet.set_router_flags(flags);
+                packet.set_router_lifetime(router_lifetime);
                 #[cfg(feature = "proto-ipv6-rio")]
                 {
-                    // RFC 4191 requires Medium on the wire when the router
-                    // lifetime is zero, regardless of the representation.
-                    let preference = if router_lifetime == Duration::ZERO {
+                    // Encode the lifetime first because sub-second values and
+                    // the existing u16 conversion can produce zero from a
+                    // nonzero representation. RFC 4191 requires Medium based
+                    // on the value that is actually sent on the wire.
+                    let preference = if packet.router_lifetime() == Duration::ZERO {
                         NdiscRoutePreference::Medium
                     } else {
                         preference.normalized_for_router_header()
                     };
                     packet.set_router_preference(preference);
                 }
-                packet.set_router_lifetime(router_lifetime);
                 packet.set_reachable_time(reachable_time);
                 packet.set_retrans_time(retrans_time);
                 let mut offset = 0;
@@ -823,6 +825,29 @@ mod test {
         let mut packet = Packet::new_unchecked(&mut bytes[..]);
         repr.emit(&mut packet);
         assert_eq!(packet.router_preference(), NdiscRoutePreference::Medium);
+
+        for router_lifetime in [
+            Duration::from_millis(500),
+            Duration::from_secs(u16::MAX as u64 + 1),
+        ] {
+            let repr = Repr::RouterAdvert {
+                hop_limit: 64,
+                flags: RouterFlags::MANAGED,
+                preference: NdiscRoutePreference::High,
+                router_lifetime,
+                reachable_time: Duration::ZERO,
+                retrans_time: Duration::ZERO,
+                lladdr: None,
+                mtu: None,
+                prefix_info: None,
+                route_info: RouteInformationList::new(),
+            };
+            let mut bytes = [0; 16];
+            let mut packet = Packet::new_unchecked(&mut bytes[..]);
+            repr.emit(&mut packet);
+            assert_eq!(packet.router_lifetime(), Duration::ZERO);
+            assert_eq!(packet.router_preference(), NdiscRoutePreference::Medium);
+        }
     }
 
     #[test]

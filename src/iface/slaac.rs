@@ -741,6 +741,19 @@ impl Slaac {
         #[cfg(feature = "proto-ipv6-rio")]
         let mut has_withdrawn_routes = false;
 
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            let previous_route_count = self.routes.len();
+            // Normal `poll()` performs maintenance before ingress, but users
+            // of the split polling API may receive this RA first. Remove
+            // expired candidates here so they cannot occupy admission slots
+            // or preserve stale tie-breaking order for a refreshed route.
+            self.routes.retain(|route| route.is_valid(now));
+            if self.routes.len() != previous_route_count {
+                self.sync_required = true;
+            }
+        }
+
         if let Some(prefix) = prefix
             && prefix.is_valid_prefix_info()
         {
@@ -1443,6 +1456,62 @@ mod test {
                 .routes()
                 .windows(2)
                 .all(|pair| pair[0].identity_cmp(&pair[1]) == Ordering::Less)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_advertisement_prunes_expired_candidates_before_admission() {
+        if IFACE_MAX_ROUTE_COUNT == 0 {
+            return;
+        }
+
+        let mut slaac = Slaac::new();
+        let expired_at = Instant::from_secs(1);
+        for index in 0..IFACE_MAX_ROUTE_COUNT {
+            let address = Ipv6Address::new(
+                0x2001,
+                0xdb8,
+                0,
+                0,
+                0,
+                0,
+                (index >> 16) as u16,
+                index as u16,
+            );
+            slaac.add_route(
+                &Ipv6Cidr::new(address, 128),
+                &SOURCE,
+                NdiscRoutePreference::High,
+                Some(expired_at),
+            );
+        }
+        assert!(slaac.routes().is_full());
+
+        let now = Instant::from_secs(2);
+        let fresh = NdiscRouteInformation {
+            prefix_len: 1,
+            preference: NdiscRoutePreference::Low,
+            route_lifetime: Duration::from_secs(600),
+            prefix: Ipv6Address::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
+        };
+        slaac.process_advertisement(
+            &SOURCE_2,
+            Duration::ZERO,
+            NdiscRoutePreference::Medium,
+            None,
+            route_info_list(fresh),
+            now,
+        );
+
+        // The fresh /1 is deliberately less useful than every expired /128.
+        // It is retained because expired routes are no longer candidates.
+        assert_eq!(slaac.routes().len(), 1);
+        assert_eq!(slaac.routes()[0].cidr, Ipv6Cidr::new(fresh.prefix, 1));
+        assert_eq!(slaac.routes()[0].via_router, SOURCE_2);
+        assert_eq!(
+            slaac.routes()[0].valid_until,
+            Some(now + fresh.route_lifetime)
         );
     }
 
