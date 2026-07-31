@@ -1174,6 +1174,13 @@ impl InterfaceInner {
                     net_debug!("Failed to dispatch NDISC solicit: {:?}", e);
                     return Err(DispatchError::NeighborPending);
                 }
+
+                // RFC 4861 section 7.2.5 discards Neighbor Advertisements that
+                // have no live or incomplete target entry. Record only a
+                // solicitation that was actually dispatched, so its response
+                // can complete address resolution.
+                self.neighbor_cache
+                    .record_neighbor_probe(dst_addr, self.now);
             }
 
             #[allow(unreachable_patterns)]

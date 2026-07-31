@@ -166,6 +166,24 @@ impl Slaac {
         }
     }
 
+    /// Invalidate every route learned through `router`.
+    ///
+    /// [RFC 4861 § 7.2.5] requires that a node which learns that a neighbor is
+    /// no longer a router removes the routes that used it as a next hop.
+    ///
+    /// [RFC 4861 § 7.2.5]: https://datatracker.ietf.org/doc/html/rfc4861#section-7.2.5
+    pub(crate) fn remove_router(&mut self, router: &Ipv6Address) -> bool {
+        let mut removed = false;
+        for route in self.routes.iter_mut() {
+            if route.via_router == *router && route.valid_until > Instant::from_millis(0) {
+                route.valid_until = Instant::from_millis(0);
+                self.sync_required = true;
+                removed = true;
+            }
+        }
+        removed
+    }
+
     fn process_prefix(&mut self, prefix: NdiscPrefixInformation, now: Instant) {
         if !prefix.flags.contains(NdiscPrefixInfoFlags::ADDRCONF) {
             return;

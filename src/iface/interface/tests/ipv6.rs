@@ -644,9 +644,42 @@ fn ndisc_neighbor_advertisement_ethernet(#[case] medium: Medium) {
         response
     );
 
+    // RFC 4861 section 7.2.5 keys the update on the advertisement target, not
+    // on the IPv6 source, and discards the advertisement when no Neighbor
+    // Cache entry exists for that target.
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
             &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
+    );
+
+    // With address resolution in progress for the target, the same
+    // advertisement completes the entry keyed by the target address.
+    iface.inner.neighbor_cache.record_neighbor_probe(
+        Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002),
+        iface.inner.now,
+    );
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&data[..]).unwrap()
+        ),
+        response
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
@@ -754,9 +787,35 @@ fn ndisc_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
         response
     );
 
+    // RFC 4861 section 7.2.5 keys the update on the advertisement target, not
+    // on the IPv6 source, and discards the advertisement when no Neighbor
+    // Cache entry exists for that target.
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
             &IpAddress::Ipv6(Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002)),
+            iface.inner.now,
+        ),
+        NeighborAnswer::NotFound,
+    );
+
+    // With address resolution in progress for the target, the same
+    // advertisement completes the entry keyed by the target address.
+    iface.inner.neighbor_cache.record_neighbor_probe(
+        Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002),
+        iface.inner.now,
+    );
+    assert_eq!(
+        iface.inner.process_ipv6(
+            &mut sockets,
+            PacketMeta::default(),
+            HardwareAddress::default(),
+            &Ipv6Packet::new_checked(&data[..]).unwrap()
+        ),
+        response
+    );
+    assert_eq!(
+        iface.inner.neighbor_cache.lookup(
+            &IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002)),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
@@ -1865,4 +1924,57 @@ fn test_solicited_node_multicast_autojoin(#[case] medium: Medium) {
     });
     assert!(!iface.has_multicast_group(addr1.solicited_node()));
     assert!(!iface.has_multicast_group(addr2.solicited_node()));
+}
+
+#[rstest]
+#[case::ethernet(Medium::Ethernet)]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6-slaac"))]
+fn ndisc_is_router_transition_invalidates_routes(#[case] medium: Medium) {
+    let (mut iface, _sockets, _device) = setup(medium);
+    iface.inner.slaac_enabled = true;
+
+    let router = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0002);
+    let router_hw = RawHardwareAddress::from_bytes(&[0, 0, 0, 0, 0, 2]);
+
+    // A valid Router Advertisement creates the router's Neighbor Cache entry
+    // with IsRouter TRUE and installs a default route.
+    let ra = NdiscRepr::RouterAdvert {
+        hop_limit: 64,
+        flags: NdiscRouterFlags::empty(),
+        router_lifetime: Duration::from_secs(1800),
+        reachable_time: Duration::ZERO,
+        retrans_time: Duration::ZERO,
+        lladdr: Some(router_hw),
+        mtu: None,
+        prefix_info: None,
+    };
+    let ra_ip_repr = Ipv6Repr {
+        src_addr: router,
+        dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+        next_header: IpProtocol::Icmpv6,
+        hop_limit: 255,
+        payload_len: 0,
+    };
+    assert_eq!(iface.inner.process_ndisc(ra_ip_repr, ra), None);
+    assert!(iface.inner.neighbor_cache.is_router(&router, iface.inner.now));
+    assert_eq!(iface.inner.slaac.routes().len(), 1);
+    assert!(iface.inner.slaac.routes()[0].is_valid(iface.inner.now));
+
+    // RFC 4861 section 7.2.5: an accepted advertisement with the Router flag
+    // clear invalidates the routes that used this neighbor as a next hop.
+    let na = NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+        target_addr: router,
+        lladdr: Some(router_hw),
+    };
+    let na_ip_repr = Ipv6Repr {
+        src_addr: router,
+        dst_addr: Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 0x0001),
+        next_header: IpProtocol::Icmpv6,
+        hop_limit: 255,
+        payload_len: 0,
+    };
+    assert_eq!(iface.inner.process_ndisc(na_ip_repr, na), None);
+    assert!(!iface.inner.neighbor_cache.is_router(&router, iface.inner.now));
+    assert!(!iface.inner.slaac.routes()[0].is_valid(iface.inner.now));
 }

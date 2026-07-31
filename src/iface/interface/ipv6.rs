@@ -459,18 +459,82 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
-                if let Some(lladdr) = lladdr {
+                if !target_addr.x_is_unicast()
+                    || (flags.contains(NdiscNeighborFlags::SOLICITED)
+                        && ip_repr.dst_addr.is_multicast())
+                {
+                    // RFC 4861 section 7.1.2 makes both conditions invalid;
+                    // neither the mapping nor reachability state may change.
+                    return None;
+                }
+
+                // RFC 4861 section 7.2.5 updates the Neighbor Cache entry
+                // identified by the NA target, which can differ from the IPv6
+                // source for a proxy advertisement.
+                let target_ip_addr = target_addr.into();
+                let cached_hardware_addr = match self.neighbor_cache.lookup(&target_ip_addr, self.now)
+                {
+                    NeighborAnswer::Found(hardware_addr) => Some(hardware_addr),
+                    NeighborAnswer::NotFound | NeighborAnswer::RateLimited => None,
+                };
+                let entry_exists = cached_hardware_addr.is_some()
+                    || self
+                        .neighbor_cache
+                        .neighbor_probe_outstanding(&target_addr, self.now);
+                if !entry_exists {
+                    // RFC 4861 section 7.2.5 discards an NA when the host has
+                    // neither a live target entry nor an outstanding
+                    // solicitation.
+                    return None;
+                }
+                let _was_router = self.neighbor_cache.is_router(&target_addr, self.now);
+                let accepted = if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
-                    if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
+                    if !lladdr.is_unicast() {
                         return None;
                     }
-                    if flags.contains(NdiscNeighborFlags::OVERRIDE)
-                        || !self.neighbor_cache.lookup(&ip_addr, self.now).found()
+
+                    if cached_hardware_addr.is_some_and(|cached| cached != lladdr)
+                        && !flags.contains(NdiscNeighborFlags::OVERRIDE)
                     {
-                        self.neighbor_cache.fill(ip_addr, lladdr, self.now)
+                        // Override=0 explicitly protects a different cached
+                        // TLLA. The NA leaves both that mapping and NUD
+                        // reachability state unchanged.
+                        false
+                    } else {
+                        if flags.contains(NdiscNeighborFlags::OVERRIDE)
+                            || cached_hardware_addr.is_none()
+                        {
+                            self.neighbor_cache.fill(target_ip_addr, lladdr, self.now);
+                        }
+                        true
                     }
+                } else {
+                    // An NA without a TLLA can complete NUD only when a usable
+                    // target mapping already exists. Otherwise RFC 4861
+                    // section 7.2.5 requires it to be discarded.
+                    cached_hardware_addr.is_some()
+                };
+                if !accepted {
+                    return None;
                 }
+
+                let is_router = flags.contains(NdiscNeighborFlags::ROUTER);
+                let _prior_live_role =
+                    self.neighbor_cache
+                        .set_router_if_live(&target_addr, is_router, self.now);
+                debug_assert!(
+                    _prior_live_role.is_some(),
+                    "an accepted NA must leave a live target mapping"
+                );
+
+                #[cfg(feature = "proto-ipv6-slaac")]
+                if !is_router && _was_router {
+                    // RFC 4861 section 7.2.5 invalidates routes only for a
+                    // TRUE-to-FALSE IsRouter transition.
+                    self.slaac.remove_router(&target_addr);
+                }
+
                 None
             }
             NdiscRepr::NeighborSolicit {
@@ -483,8 +547,17 @@ impl InterfaceInner {
                     if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                         return None;
                     }
-                    self.neighbor_cache
-                        .fill(ip_repr.src_addr.into(), lladdr, self.now);
+                    if !ip_repr.src_addr.x_is_unicast() {
+                        // RFC 4861 section 7.1.1: an unspecified source with an
+                        // SLLA is invalid. Not inserting the mapping also stops
+                        // an unsolicited packet from clearing NUD evidence.
+                        return None;
+                    }
+                    self.neighbor_cache.fill_from_neighbor_solicitation(
+                        ip_repr.src_addr,
+                        lladdr,
+                        self.now,
+                    );
                 }
 
                 if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {
@@ -513,7 +586,7 @@ impl InterfaceInner {
                 router_lifetime,
                 reachable_time: _,
                 retrans_time: _,
-                lladdr: _,
+                lladdr,
                 mtu: _,
                 prefix_info,
             } if self.slaac_enabled => {
@@ -522,6 +595,31 @@ impl InterfaceInner {
                         || ip_repr.dst_addr.is_link_local())
                     && ip_repr.hop_limit == 255
                 {
+                    // RFC 4861 section 6.3.4: a valid SLLA creates or updates
+                    // the router's Neighbor Cache entry with IsRouter TRUE.
+                    // SLLA validity is independent of the surrounding RA, so an
+                    // absent or unusable option still leaves the header and
+                    // prefix information usable.
+                    match lladdr
+                        .and_then(|lladdr| lladdr.parse(self.caps.medium).ok())
+                        .filter(HardwareAddress::is_unicast)
+                    {
+                        Some(lladdr) => {
+                            self.neighbor_cache.fill_from_router_advertisement(
+                                ip_repr.src_addr,
+                                lladdr,
+                                self.now,
+                            );
+                        }
+                        None => {
+                            self.neighbor_cache.set_router_if_live(
+                                &ip_repr.src_addr,
+                                true,
+                                self.now,
+                            );
+                        }
+                    }
+
                     self.slaac.process_advertisement(
                         &ip_repr.src_addr,
                         router_lifetime,
