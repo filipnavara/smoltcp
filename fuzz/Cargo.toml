@@ -18,7 +18,8 @@ getopts = "0.2"
 smoltcp = { path = "..", default-features = false, features = [
     "std",
     "medium-ethernet", "medium-ieee802154",
-    "proto-ipv4", "proto-dhcpv4", "proto-ipv6", "proto-sixlowpan",
+    "proto-ipv4", "proto-dhcpv4", "proto-ipv6", "proto-ipv6-slaac", "proto-ipv6-rio",
+    "proto-sixlowpan",
     "socket-raw", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4",
     "multicast",
 ]}

@@ -902,7 +902,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
 
 #[rstest]
 #[case(Medium::Ethernet)]
-#[cfg(feature = "proto-ipv6-slaac")]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6-slaac"))]
 fn test_router_advertisement(#[case] medium: Medium) {
     fn recv_icmpv6(
         device: &mut crate::tests::TestingDevice,
@@ -1011,12 +1011,16 @@ fn test_router_advertisement(#[case] medium: Medium) {
     let mut advertisement = NdiscRepr::RouterAdvert {
         hop_limit: 255,
         flags: NdiscRouterFlags::empty(),
+        #[cfg(feature = "proto-ipv6-rio")]
+        preference: NdiscRoutePreference::Medium,
         router_lifetime: Duration::from_secs(600),
         reachable_time: Duration::from_secs(0),
         retrans_time: Duration::from_secs(0),
         lladdr: None,
         mtu: None,
         prefix_info: Some(prefix_information),
+        #[cfg(feature = "proto-ipv6-rio")]
+        route_info: NdiscRouteInformationList::new(),
     };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr.address(),
@@ -1941,12 +1945,16 @@ fn ndisc_is_router_transition_invalidates_routes(#[case] medium: Medium) {
     let ra = NdiscRepr::RouterAdvert {
         hop_limit: 64,
         flags: NdiscRouterFlags::empty(),
+        #[cfg(feature = "proto-ipv6-rio")]
+        preference: NdiscRoutePreference::Medium,
         router_lifetime: Duration::from_secs(1800),
         reachable_time: Duration::ZERO,
         retrans_time: Duration::ZERO,
         lladdr: Some(router_hw),
         mtu: None,
         prefix_info: None,
+        #[cfg(feature = "proto-ipv6-rio")]
+        route_info: NdiscRouteInformationList::new(),
     };
     let ra_ip_repr = Ipv6Repr {
         src_addr: router,

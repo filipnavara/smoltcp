@@ -583,12 +583,16 @@ impl InterfaceInner {
             NdiscRepr::RouterAdvert {
                 hop_limit: _,
                 flags: _,
+                #[cfg(feature = "proto-ipv6-rio")]
+                    preference: _,
                 router_lifetime,
                 reachable_time: _,
                 retrans_time: _,
                 lladdr,
                 mtu: _,
                 prefix_info,
+                #[cfg(feature = "proto-ipv6-rio")]
+                    route_info: _,
             } if self.slaac_enabled => {
                 if ip_repr.src_addr.is_link_local()
                     && (ip_repr.dst_addr == IPV6_LINK_LOCAL_ALL_NODES
