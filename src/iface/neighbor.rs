@@ -2,12 +2,19 @@
 // the parts of RFC 1122 that discuss ARP.
 
 use heapless::LinearMap;
+#[cfg(feature = "proto-ipv6-rio")]
+use heapless::Vec;
 
+#[cfg(feature = "proto-ipv6-rio")]
+use crate::config::IFACE_MAX_ROUTE_COUNT;
 use crate::config::IFACE_NEIGHBOR_CACHE_COUNT;
 use crate::time::{Duration, Instant};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::Ipv6Address;
 use crate::wire::{HardwareAddress, IpAddress};
+
+#[cfg(feature = "proto-ipv6-rio")]
+const MAX_RTR_PROBES: u8 = 3;
 
 /// Number of Neighbor Solicitations sent before address resolution is abandoned.
 ///
@@ -16,6 +23,90 @@ use crate::wire::{HardwareAddress, IpAddress};
 /// [RFC 4861 § 10]: https://datatracker.ietf.org/doc/html/rfc4861#section-10
 #[cfg(feature = "proto-ipv6")]
 const MAX_NEIGHBOR_PROBES: u8 = 3;
+
+#[cfg(feature = "proto-ipv6-rio")]
+const RTR_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(feature = "proto-ipv6-rio")]
+const ROUTER_RESOLUTION_COUNT: usize = IFACE_MAX_ROUTE_COUNT;
+
+/// Resolution state for an IPv6 router.
+#[cfg(feature = "proto-ipv6-rio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum RouterResolutionState {
+    /// No failed resolution attempt is known.
+    Unknown,
+    /// Resolution attempts are still in progress.
+    Pending,
+    /// The bounded resolution attempt count was exhausted.
+    Unreachable,
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct RouterResolution {
+    probes_sent: u8,
+    last_probe_at: Instant,
+    recovery_destination: Option<Ipv6Address>,
+    recovery_probe_sent: bool,
+    active: bool,
+}
+
+#[cfg(feature = "proto-ipv6-rio")]
+impl RouterResolution {
+    fn unreachable_at(&self) -> Instant {
+        self.last_probe_at + Cache::SILENT_TIME
+    }
+
+    fn resolution_failure_at(&self) -> Instant {
+        let remaining_windows = u32::from(MAX_RTR_PROBES.saturating_sub(self.probes_sent)) + 1;
+        self.last_probe_at + Cache::SILENT_TIME * remaining_windows
+    }
+
+    fn resolution_is_outstanding(&self, now: Instant) -> bool {
+        !self.recovery_probe_sent && self.last_probe_at <= now && now < self.resolution_failure_at()
+    }
+
+    fn retry_at(&self) -> Instant {
+        if self.recovery_probe_sent {
+            // Recovery probes do not re-enter the one-second resolution
+            // grace period, so their RFC 4191 throttle starts when sent.
+            self.last_probe_at + RTR_PROBE_RETRY_INTERVAL
+        } else {
+            self.unreachable_at() + RTR_PROBE_RETRY_INTERVAL
+        }
+    }
+
+    fn state(&self, now: Instant) -> RouterResolutionState {
+        if self.recovery_probe_sent {
+            // A recovery probe is deliberately separate from address
+            // resolution. Keep data on the fallback until an NA proves that
+            // the avoided router is reachable again.
+            RouterResolutionState::Unreachable
+        } else if self.probes_sent < MAX_RTR_PROBES || now < self.unreachable_at() {
+            RouterResolutionState::Pending
+        } else {
+            RouterResolutionState::Unreachable
+        }
+    }
+
+    fn poll_at(&self, now: Instant) -> Option<Instant> {
+        match self.state(now) {
+            RouterResolutionState::Unknown => None,
+            // Socket metadata already schedules the next useful address-
+            // resolution attempt. Waking only this state after probes one or
+            // two cannot send anything and needlessly wakes idle systems.
+            RouterResolutionState::Pending if self.probes_sent < MAX_RTR_PROBES => None,
+            RouterResolutionState::Pending => Some(self.unreachable_at()),
+            RouterResolutionState::Unreachable if self.recovery_destination.is_some() => {
+                Some(self.retry_at().max(now))
+            }
+            RouterResolutionState::Unreachable => None,
+        }
+    }
+}
 
 /// An in-progress address resolution for an IPv6 neighbor.
 ///
@@ -108,6 +199,10 @@ impl Answer {
 pub struct Cache {
     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
     silent_until: Instant,
+    #[cfg(feature = "proto-ipv6-rio")]
+    router_resolution: Vec<(Ipv6Address, RouterResolution), ROUTER_RESOLUTION_COUNT>,
+    #[cfg(feature = "proto-ipv6-rio")]
+    router_resolution_revision: u64,
     #[cfg(feature = "proto-ipv6")]
     neighbor_resolution: LinearMap<Ipv6Address, NeighborResolution, IFACE_NEIGHBOR_CACHE_COUNT>,
 }
@@ -124,9 +219,79 @@ impl Cache {
         Self {
             storage: LinearMap::new(),
             silent_until: Instant::from_millis(0),
+            #[cfg(feature = "proto-ipv6-rio")]
+            router_resolution: Vec::new(),
+            #[cfg(feature = "proto-ipv6-rio")]
+            router_resolution_revision: 0,
             #[cfg(feature = "proto-ipv6")]
             neighbor_resolution: LinearMap::new(),
         }
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn router_resolution_index(&self, address: &Ipv6Address) -> Result<usize, usize> {
+        // Route selection can query one resolution for every retained RIO.
+        // Keeping the fixed-capacity records sorted makes those lookups O(log N)
+        // without restricting user-configurable capacities as a hash map would.
+        self.router_resolution
+            .binary_search_by_key(address, |(router, _)| *router)
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn router_resolution(&self, address: &Ipv6Address) -> Option<&RouterResolution> {
+        self.router_resolution_index(address)
+            .ok()
+            .map(|index| &self.router_resolution[index].1)
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn router_resolution_mut(&mut self, address: &Ipv6Address) -> Option<&mut RouterResolution> {
+        self.router_resolution_index(address)
+            .ok()
+            .map(|index| &mut self.router_resolution[index].1)
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn clear_router_probe_context(&mut self, address: &Ipv6Address) {
+        if let Some(resolution) = self.router_resolution_mut(address) {
+            resolution.recovery_destination = None;
+        }
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn remove_router_resolution(&mut self, address: &Ipv6Address) {
+        if let Ok(index) = self.router_resolution_index(address) {
+            self.router_resolution.remove(index);
+        }
+    }
+
+    /// Synchronize resolution records with learned routers in the public table.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn sync_router_resolutions(
+        &mut self,
+        routes_revision: u64,
+        learned_routers: impl Iterator<Item = Ipv6Address>,
+    ) {
+        if self.router_resolution_revision == routes_revision {
+            return;
+        }
+        self.router_resolution_revision = routes_revision;
+
+        // A route change can invalidate the router itself. Retained recovery
+        // destinations are revalidated immediately before egress, so an
+        // unrelated revision must not discard the useful-traffic witness.
+        // Marking active learned routers through logarithmic lookups permits
+        // one linear prune without capacity-sized scratch.
+        for (_, resolution) in &mut self.router_resolution {
+            resolution.active = false;
+        }
+        for router in learned_routers {
+            if let Some(resolution) = self.router_resolution_mut(&router) {
+                resolution.active = true;
+            }
+        }
+        self.router_resolution
+            .retain(|(_, resolution)| resolution.active);
     }
 
     pub fn reset_expiry_if_existing(
@@ -257,7 +422,7 @@ impl Cache {
                 }
             }
         }
-        #[cfg(feature = "proto-ipv6")]
+        #[cfg(feature = "proto-ipv6-rio")]
         match protocol_addr {
             IpAddress::Ipv6(target) => {
                 // A learned mapping completes only the matching INCOMPLETE
@@ -352,6 +517,35 @@ impl Cache {
             .is_some_and(|neighbor| timestamp < neighbor.expires_at && neighbor.is_router)
     }
 
+    pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
+        assert!(protocol_addr.is_unicast());
+
+        if let Some(&Neighbor {
+            expires_at,
+            hardware_addr,
+            ..
+        }) = self.storage.get(protocol_addr)
+            && timestamp < expires_at
+        {
+            return Answer::Found(hardware_addr);
+        }
+
+        if timestamp < self.silent_until {
+            Answer::RateLimited
+        } else {
+            Answer::NotFound
+        }
+    }
+
+    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
+        self.silent_until = timestamp + Self::SILENT_TIME;
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn probe_is_outstanding(sent_at: Instant, now: Instant) -> bool {
+        sent_at <= now && now < sent_at + Self::SILENT_TIME
+    }
+
     /// Record an actually dispatched IPv6 Neighbor Solicitation.
     ///
     /// This stands in for the INCOMPLETE Neighbor Cache entry that [RFC 4861
@@ -392,34 +586,198 @@ impl Cache {
             .is_some_and(|resolution| resolution.is_outstanding(now))
     }
 
-    pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
-        assert!(protocol_addr.is_unicast());
-
-        if let Some(&Neighbor {
-            expires_at,
-            hardware_addr,
-            ..
-        }) = self.storage.get(protocol_addr)
-            && timestamp < expires_at
-        {
-            return Answer::Found(hardware_addr);
+    /// Record that a Neighbor Solicitation was sent to an IPv6 router.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn record_router_probe(&mut self, address: Ipv6Address, now: Instant) {
+        if let Some(resolution) = self.router_resolution_mut(&address) {
+            if resolution.probes_sent < MAX_RTR_PROBES {
+                if resolution.resolution_is_outstanding(now) {
+                    resolution.probes_sent += 1;
+                } else {
+                    // An incomplete resolution cycle has a bounded synthetic
+                    // lifetime. A much later NS starts a new cycle instead of
+                    // inheriting probe attempts from abandoned traffic.
+                    resolution.probes_sent = 1;
+                }
+                resolution.last_probe_at = now;
+            }
+            return;
         }
 
-        if timestamp < self.silent_until {
-            Answer::RateLimited
-        } else {
-            Answer::NotFound
+        let resolution = RouterResolution {
+            probes_sent: 1,
+            last_probe_at: now,
+            recovery_destination: None,
+            recovery_probe_sent: false,
+            active: true,
+        };
+
+        let insertion_index = self
+            .router_resolution_index(&address)
+            .expect_err("new router resolution unexpectedly exists");
+        // Resolution writes happen only when an NS is actually sent.
+        // Paying the bounded shift here keeps the route-selection read path
+        // sublinear without adding a second fixed-capacity index.
+        if self
+            .router_resolution
+            .insert(insertion_index, (address, resolution))
+            .is_err()
+        {
+            // Evicting a failed preferred router makes it Unknown and can
+            // repeatedly divert traffic away from a reachable fallback. The
+            // store is sized for every public learned route and stale records
+            // are pruned on revision changes, so fullness is an invariant bug.
+            debug_assert!(
+                false,
+                "router-resolution storage must cover all active learned routers"
+            );
         }
     }
 
-    pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
-        self.silent_until = timestamp + Self::SILENT_TIME;
+    /// Return whether router resolution or a recovery response is outstanding.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_probe_outstanding(&self, address: &Ipv6Address, now: Instant) -> bool {
+        self.router_resolution(address).is_some_and(|resolution| {
+            if resolution.recovery_probe_sent {
+                // Recovery is a single throttled probe, not a new address-
+                // resolution cycle, so it authorizes only its response window.
+                Self::probe_is_outstanding(resolution.last_probe_at, now)
+            } else {
+                resolution.resolution_is_outstanding(now)
+            }
+        })
+    }
+
+    /// Record reachability confirmed by Neighbor Unreachability Detection.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn confirm_router_reachable(&mut self, address: &Ipv6Address) {
+        // Learning or refreshing a link-layer mapping alone is not an
+        // RFC 4861 reachability confirmation. Callers must invoke this only
+        // for a validated solicited NA or a genuine upper-layer hint.
+        self.remove_router_resolution(address);
+    }
+
+    /// Record an RFC 4861 transition from unreachable to STALE.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn mark_router_stale(&mut self, address: &Ipv6Address) {
+        // An accepted unsolicited NA that changes the TLLA has not
+        // confirmed bidirectional reachability, but STALE is also no longer
+        // negative evidence. Removing only the resolution record represents
+        // that distinction in this cache's simpler reachable/unknown model.
+        self.remove_router_resolution(address);
+    }
+
+    /// Return the current resolution state for an IPv6 router.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_resolution_state(
+        &self,
+        address: &Ipv6Address,
+        now: Instant,
+    ) -> RouterResolutionState {
+        // Never-seen routers must stay Unknown: RFC 4191 requires hosts to
+        // assume reachability when they have no contrary information.
+        self.router_resolution(address)
+            .map_or(RouterResolutionState::Unknown, |resolution| {
+                resolution.state(now)
+            })
+    }
+
+    /// Return whether an IPv6 router is known to be unreachable.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn is_router_unreachable(&self, address: &Ipv6Address, now: Instant) -> bool {
+        self.router_resolution_state(address, now) == RouterResolutionState::Unreachable
+    }
+
+    /// Request a recovery probe because useful traffic selected a fallback.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn request_router_probe(
+        &mut self,
+        address: Ipv6Address,
+        destination: Ipv6Address,
+        now: Instant,
+    ) -> bool {
+        let Some(resolution) = self.router_resolution_mut(&address) else {
+            return false;
+        };
+        if resolution.state(now) != RouterResolutionState::Unreachable {
+            return false;
+        }
+
+        // There can be at most one useful-traffic witness per tracked
+        // router. Co-locating it with the address-keyed resolution avoids a
+        // second linear context lookup for every matching learned route.
+        resolution.recovery_destination = Some(destination);
+        true
+    }
+
+    /// Return a requested recovery probe that may be sent now.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_probe_required(&self, now: Instant) -> Option<Ipv6Address> {
+        self.router_resolution
+            .iter()
+            .find_map(|(address, resolution)| {
+                (resolution.state(now) == RouterResolutionState::Unreachable
+                    && resolution.recovery_destination.is_some()
+                    && now >= resolution.retry_at())
+                .then_some(*address)
+            })
+    }
+
+    /// Iterate over the useful-traffic context that requested this probe.
+    ///
+    /// At most one destination is retained for each router.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_probe_destinations(
+        &self,
+        address: Ipv6Address,
+    ) -> impl Iterator<Item = Ipv6Address> + '_ {
+        self.router_resolution(&address)
+            .and_then(|resolution| resolution.recovery_destination)
+            .into_iter()
+    }
+
+    /// Cancel a recovery request while preserving negative reachability state.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn cancel_router_probe(&mut self, address: &Ipv6Address) {
+        self.clear_router_probe_context(address);
+    }
+
+    /// Record a separately dispatched RFC 4191 recovery probe.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_recovery_probe_sent(&mut self, address: Ipv6Address, now: Instant) {
+        if let Some(resolution) = self.router_resolution_mut(&address) {
+            resolution.recovery_destination = None;
+            resolution.probes_sent = MAX_RTR_PROBES;
+            resolution.last_probe_at = now;
+            resolution.recovery_probe_sent = true;
+        }
+    }
+
+    /// Stop tracking a router that is no longer advertised.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn discard_router_resolution(&mut self, address: &Ipv6Address) {
+        self.remove_router_resolution(address);
+    }
+
+    /// Return the next router-resolution state transition.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn router_resolution_poll_at(&self, now: Instant) -> Option<Instant> {
+        self.router_resolution
+            .iter()
+            .filter_map(|(_, resolution)| resolution.poll_at(now))
+            .min()
     }
 
     pub(crate) fn flush(&mut self) {
         self.storage.clear();
-        #[cfg(feature = "proto-ipv6")]
-        self.neighbor_resolution.clear();
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            self.neighbor_resolution.clear();
+            // Explicit address reconfiguration historically resets all
+            // neighbor state. The automatic SLAAC path avoids calling flush
+            // when it must preserve RA and NUD state across an internal update.
+            self.router_resolution.clear();
+        }
     }
 }
 
@@ -481,7 +839,7 @@ mod test {
         );
     }
 
-    #[cfg(all(feature = "proto-ipv6", feature = "proto-ipv6-slaac"))]
+    #[cfg(feature = "proto-ipv6-rio")]
     #[test]
     fn test_ndisc_mapping_reports_changes_and_preserves_is_router() {
         let mut cache = Cache::new();
@@ -510,7 +868,7 @@ mod test {
         assert!(!cache.is_router(&address, t0));
     }
 
-    #[cfg(all(feature = "proto-ipv6", feature = "proto-ipv6-slaac"))]
+    #[cfg(feature = "proto-ipv6-rio")]
     #[test]
     fn test_expired_neighbor_has_no_is_router_state() {
         let mut cache = Cache::new();
@@ -538,9 +896,9 @@ mod test {
         assert!(cache.is_router(&address, expired_at));
     }
 
-    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6"))]
+    #[cfg(all(feature = "proto-ipv4", feature = "proto-ipv6-rio"))]
     #[test]
-    fn test_ipv6_expiry_rules_preserve_ipv4_cache_behavior() {
+    fn test_rio_expiry_rules_preserve_ipv4_cache_behavior() {
         if IFACE_NEIGHBOR_CACHE_COUNT == 0 {
             return;
         }
@@ -568,51 +926,11 @@ mod test {
         cache.fill(first.into(), HADDR_C, expired_at);
 
         // Updating an existing IPv4 entry stays in place, preserving the
-        // original tie order used when the cache later needs an eviction.
+        // pre-RIO tie order used when the cache later needs an eviction.
         assert_eq!(
             cache.storage.iter().next().map(|(address, _)| *address),
             Some(first.into())
         );
-    }
-
-    #[cfg(feature = "proto-ipv6")]
-    #[test]
-    fn test_outbound_ndisc_probe_windows() {
-        let mut cache = Cache::new();
-        let t0 = Instant::from_secs(10);
-        let t1 = t0 + Cache::SILENT_TIME;
-        let t2 = t1 + Cache::SILENT_TIME;
-        let t3 = t2 + Cache::SILENT_TIME;
-
-        let mut abandoned_cache = Cache::new();
-        abandoned_cache.record_neighbor_probe(MOCK_IP_ADDR_4, t0);
-        assert!(abandoned_cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_4, t2));
-        assert!(!abandoned_cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_4, t3));
-
-        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t0);
-        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
-        assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
-        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t1));
-
-        if IFACE_NEIGHBOR_CACHE_COUNT >= 2 {
-            cache.record_neighbor_probe(MOCK_IP_ADDR_2, t0);
-            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
-            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
-            // A completed resolution clears only the matching record.
-            cache.fill(MOCK_IP_ADDR_2.into(), HADDR_A, t0);
-            assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
-            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
-        }
-
-        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t1);
-        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t2));
-        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t2);
-        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t2 + Duration::from_millis(999)));
-        assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t3));
-
-        // A later solicitation starts a fresh resolution cycle.
-        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t3);
-        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t3));
     }
 
     #[test]
@@ -704,6 +1022,13 @@ mod test {
         let mut cache = Cache::new();
 
         cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            if ROUTER_RESOLUTION_COUNT != 0 {
+                cache.record_router_probe(MOCK_IP_ADDR_1, Instant::ZERO);
+            }
+            cache.record_neighbor_probe(MOCK_IP_ADDR_2, Instant::ZERO);
+        }
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
             Answer::Found(HADDR_A)
@@ -724,6 +1049,346 @@ mod test {
             !cache
                 .lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0))
                 .found()
+        );
+        #[cfg(feature = "proto-ipv6-rio")]
+        {
+            assert_eq!(
+                cache.router_resolution_state(&MOCK_IP_ADDR_1, Instant::ZERO),
+                RouterResolutionState::Unknown
+            );
+            assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, Instant::ZERO));
+        }
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_outbound_ndisc_probe_windows() {
+        let mut cache = Cache::new();
+        let t0 = Instant::from_secs(10);
+        let t1 = t0 + Cache::SILENT_TIME;
+        let t2 = t1 + Cache::SILENT_TIME;
+        let t3 = t2 + Cache::SILENT_TIME;
+
+        let mut abandoned_cache = Cache::new();
+        abandoned_cache.record_neighbor_probe(MOCK_IP_ADDR_4, t0);
+        assert!(abandoned_cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_4, t2));
+        assert!(!abandoned_cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_4, t3));
+
+        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t0);
+        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
+        assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
+        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t1));
+
+        if IFACE_NEIGHBOR_CACHE_COUNT >= 2 {
+            cache.record_neighbor_probe(MOCK_IP_ADDR_2, t0);
+            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
+            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
+            cache.fill(MOCK_IP_ADDR_2.into(), HADDR_A, t0);
+            assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_2, t0));
+            assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t0));
+        }
+
+        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t1);
+        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t2));
+        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t2);
+        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t2 + Duration::from_millis(999)));
+        assert!(!cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t3));
+
+        cache.record_neighbor_probe(MOCK_IP_ADDR_1, t3);
+        assert!(cache.neighbor_probe_outstanding(&MOCK_IP_ADDR_1, t3));
+
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        let mut abandoned_router_cache = Cache::new();
+        abandoned_router_cache.record_router_probe(MOCK_IP_ADDR_4, t0);
+        assert!(abandoned_router_cache.router_probe_outstanding(&MOCK_IP_ADDR_4, t2));
+        assert!(!abandoned_router_cache.router_probe_outstanding(&MOCK_IP_ADDR_4, t3));
+
+        let mut restarted_router_cache = Cache::new();
+        restarted_router_cache.record_router_probe(MOCK_IP_ADDR_4, t0);
+        let restarted_at = t3 + Cache::SILENT_TIME;
+        restarted_router_cache.record_router_probe(MOCK_IP_ADDR_4, restarted_at);
+        restarted_router_cache
+            .record_router_probe(MOCK_IP_ADDR_4, restarted_at + Cache::SILENT_TIME);
+        assert_eq!(
+            restarted_router_cache
+                .router_resolution_state(&MOCK_IP_ADDR_4, restarted_at + Cache::SILENT_TIME * 2),
+            RouterResolutionState::Pending
+        );
+        restarted_router_cache
+            .record_router_probe(MOCK_IP_ADDR_4, restarted_at + Cache::SILENT_TIME * 2);
+        assert_eq!(
+            restarted_router_cache
+                .router_resolution_state(&MOCK_IP_ADDR_4, restarted_at + Cache::SILENT_TIME * 3),
+            RouterResolutionState::Unreachable
+        );
+
+        cache.record_router_probe(MOCK_IP_ADDR_3, t0);
+        assert!(cache.router_probe_outstanding(&MOCK_IP_ADDR_3, t1));
+        cache.record_router_probe(MOCK_IP_ADDR_3, t1);
+        assert!(cache.router_probe_outstanding(&MOCK_IP_ADDR_3, t2));
+        cache.record_router_probe(MOCK_IP_ADDR_3, t2);
+        assert!(cache.router_probe_outstanding(&MOCK_IP_ADDR_3, t2 + Duration::from_millis(999)));
+        assert!(cache.is_router_unreachable(&MOCK_IP_ADDR_3, t3));
+        assert!(!cache.router_probe_outstanding(&MOCK_IP_ADDR_3, t3));
+
+        let recovery_sent_at = t3 + Cache::SILENT_TIME;
+        cache.router_recovery_probe_sent(MOCK_IP_ADDR_3, recovery_sent_at);
+        assert!(cache.router_probe_outstanding(&MOCK_IP_ADDR_3, recovery_sent_at));
+        assert!(
+            !cache.router_probe_outstanding(&MOCK_IP_ADDR_3, recovery_sent_at + Cache::SILENT_TIME)
+        );
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_resolutions_keep_address_order() {
+        if ROUTER_RESOLUTION_COUNT < 4 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let routers = [
+            MOCK_IP_ADDR_4,
+            MOCK_IP_ADDR_2,
+            MOCK_IP_ADDR_3,
+            MOCK_IP_ADDR_1,
+        ];
+        let now = Instant::from_secs(10);
+        for router in routers {
+            cache.record_router_probe(router, now);
+        }
+
+        assert_eq!(cache.router_resolution.len(), routers.len());
+        assert!(
+            cache
+                .router_resolution
+                .windows(2)
+                .all(|entries| entries[0].0 < entries[1].0)
+        );
+        for router in routers {
+            assert_eq!(
+                cache.router_resolution_state(&router, now),
+                RouterResolutionState::Pending
+            );
+        }
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_resolution_state() {
+        let mut cache = Cache::new();
+        let router = MOCK_IP_ADDR_1;
+        let destination = MOCK_IP_ADDR_2;
+        let other_destination = MOCK_IP_ADDR_3;
+        let t0 = Instant::from_secs(10);
+
+        // A never-seen router has no negative reachability information.
+        assert_eq!(
+            cache.router_resolution_state(&router, t0),
+            RouterResolutionState::Unknown
+        );
+        assert!(!cache.is_router_unreachable(&router, t0));
+
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        cache.record_router_probe(router, t0);
+        assert_eq!(
+            cache.router_resolution_state(&router, t0),
+            RouterResolutionState::Pending
+        );
+        assert_eq!(cache.router_resolution_poll_at(t0), None);
+
+        let t1 = t0 + Cache::SILENT_TIME;
+        cache.record_router_probe(router, t1);
+        assert_eq!(cache.router_resolution_poll_at(t1), None);
+        let t2 = t1 + Cache::SILENT_TIME;
+        cache.record_router_probe(router, t2);
+
+        let unreachable_at = t2 + Cache::SILENT_TIME;
+        assert_eq!(
+            cache.router_resolution_state(&router, t2),
+            RouterResolutionState::Pending
+        );
+        // The third probe has a real deadline: its timeout changes route
+        // selection from Pending to Unreachable.
+        assert_eq!(cache.router_resolution_poll_at(t2), Some(unreachable_at));
+        assert!(cache.is_router_unreachable(&router, unreachable_at));
+
+        let retry_at = unreachable_at + RTR_PROBE_RETRY_INTERVAL;
+        assert_eq!(cache.router_resolution_poll_at(unreachable_at), None);
+        cache.sync_router_resolutions(1, [router].into_iter());
+        cache.request_router_probe(router, destination, unreachable_at);
+        cache.request_router_probe(router, other_destination, unreachable_at);
+        assert_eq!(
+            cache.router_resolution_poll_at(unreachable_at),
+            Some(retry_at)
+        );
+        assert_eq!(
+            cache.router_resolution_state(&router, retry_at),
+            RouterResolutionState::Unreachable
+        );
+        assert_eq!(cache.router_probe_required(retry_at), Some(router));
+        assert_eq!(
+            cache.router_probe_destinations(router).next(),
+            Some(other_destination)
+        );
+
+        cache.router_recovery_probe_sent(router, retry_at);
+        assert_eq!(
+            cache.router_resolution_state(&router, retry_at),
+            RouterResolutionState::Unreachable
+        );
+        assert_eq!(cache.router_resolution_poll_at(retry_at), None);
+        cache.request_router_probe(router, destination, retry_at);
+        assert_eq!(
+            cache.router_resolution_poll_at(retry_at),
+            Some(retry_at + RTR_PROBE_RETRY_INTERVAL)
+        );
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_probe_context_survives_unrelated_route_revision() {
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let router = MOCK_IP_ADDR_1;
+        let t0 = Instant::from_secs(10);
+        cache.record_router_probe(router, t0);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME * 2);
+        let unreachable_at = t0 + Cache::SILENT_TIME * 3;
+        let retry_at = unreachable_at + RTR_PROBE_RETRY_INTERVAL;
+
+        cache.sync_router_resolutions(7, [router].into_iter());
+        cache.request_router_probe(router, MOCK_IP_ADDR_2, unreachable_at);
+        assert_eq!(cache.router_probe_required(retry_at), Some(router));
+
+        cache.sync_router_resolutions(8, [router].into_iter());
+        assert_eq!(
+            cache.router_probe_destinations(router).next(),
+            Some(MOCK_IP_ADDR_2)
+        );
+        assert_eq!(cache.router_probe_required(retry_at), Some(router));
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_route_revision_prunes_only_unlearned_router_resolutions() {
+        if ROUTER_RESOLUTION_COUNT < 2 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let removed_router = MOCK_IP_ADDR_1;
+        let retained_router = MOCK_IP_ADDR_2;
+        let t0 = Instant::from_secs(10);
+
+        for router in [removed_router, retained_router] {
+            cache.record_router_probe(router, t0);
+            cache.record_router_probe(router, t0 + Cache::SILENT_TIME);
+            cache.record_router_probe(router, t0 + Cache::SILENT_TIME * 2);
+        }
+        let unreachable_at = t0 + Cache::SILENT_TIME * 3;
+        cache.sync_router_resolutions(1, [removed_router, retained_router].into_iter());
+        cache.request_router_probe(removed_router, MOCK_IP_ADDR_3, unreachable_at);
+        cache.request_router_probe(retained_router, MOCK_IP_ADDR_4, unreachable_at);
+
+        cache.sync_router_resolutions(2, [retained_router].into_iter());
+
+        assert_eq!(cache.router_resolution.len(), 1);
+        assert_eq!(
+            cache.router_resolution_state(&removed_router, unreachable_at),
+            RouterResolutionState::Unknown
+        );
+        assert_eq!(
+            cache.router_resolution_state(&retained_router, unreachable_at),
+            RouterResolutionState::Unreachable
+        );
+        assert_eq!(
+            cache.router_probe_destinations(retained_router).next(),
+            Some(MOCK_IP_ADDR_4)
+        );
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_resolution_not_cleared_on_fill() {
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let router = MOCK_IP_ADDR_1;
+        let t0 = Instant::from_secs(10);
+
+        cache.record_router_probe(router, t0);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME * 2);
+        let unreachable_at = t0 + Cache::SILENT_TIME * 3;
+        assert!(cache.is_router_unreachable(&router, unreachable_at));
+
+        cache.fill(router.into(), HADDR_A, unreachable_at);
+        assert_eq!(
+            cache.router_resolution_state(&router, unreachable_at),
+            RouterResolutionState::Unreachable
+        );
+        assert!(cache.is_router_unreachable(&router, unreachable_at));
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_resolution_not_cleared_on_neighbor_refresh() {
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let router = MOCK_IP_ADDR_1;
+        let t0 = Instant::from_secs(10);
+
+        cache.fill(router.into(), HADDR_A, t0);
+        cache.record_router_probe(router, t0);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME * 2);
+        let unreachable_at = t0 + Cache::SILENT_TIME * 3;
+        assert!(cache.is_router_unreachable(&router, unreachable_at));
+
+        cache.reset_expiry_if_existing(router.into(), HADDR_A, unreachable_at);
+        assert_eq!(
+            cache.router_resolution_state(&router, unreachable_at),
+            RouterResolutionState::Unreachable
+        );
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    #[test]
+    fn test_router_resolution_cleared_only_on_confirmation() {
+        if ROUTER_RESOLUTION_COUNT == 0 {
+            return;
+        }
+
+        let mut cache = Cache::new();
+        let router = MOCK_IP_ADDR_1;
+        let t0 = Instant::from_secs(10);
+
+        cache.record_router_probe(router, t0);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME);
+        cache.record_router_probe(router, t0 + Cache::SILENT_TIME * 2);
+        let unreachable_at = t0 + Cache::SILENT_TIME * 3;
+        assert!(cache.is_router_unreachable(&router, unreachable_at));
+
+        cache.confirm_router_reachable(&router);
+        assert_eq!(
+            cache.router_resolution_state(&router, unreachable_at),
+            RouterResolutionState::Unknown
         );
     }
 }

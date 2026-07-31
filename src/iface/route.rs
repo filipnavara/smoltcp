@@ -199,6 +199,8 @@ pub struct Routes {
     storage: Vec<Route, IFACE_MAX_ROUTE_COUNT>,
     #[cfg(feature = "proto-ipv6-rio")]
     index: Vec<IndexedRoute, IFACE_MAX_ROUTE_COUNT>,
+    #[cfg(feature = "proto-ipv6-rio")]
+    revision: u64,
 }
 
 impl Routes {
@@ -208,6 +210,8 @@ impl Routes {
             storage: Vec::new(),
             #[cfg(feature = "proto-ipv6-rio")]
             index: Vec::new(),
+            #[cfg(feature = "proto-ipv6-rio")]
+            revision: 0,
         }
     }
 
@@ -224,6 +228,7 @@ impl Routes {
             // A table that holds no IPv6 routes has no ownership to track, so
             // an IPv4-only application does not pay for the rebuild.
             self.rebuild_route_index();
+            self.bump_revision();
         }
     }
 
@@ -429,6 +434,7 @@ impl Routes {
             keep
         });
         debug_assert_eq!(indexed_slot, index.len());
+        let mut changed = old_slot != new_slot;
         index.retain(|entry| {
             !matches!(
                 entry.ownership,
@@ -468,6 +474,10 @@ impl Routes {
                 )
             }) {
                 let slot = entry.slot as usize;
+                let old = entry.as_learned().expect("selected route is learned");
+                if old != candidate {
+                    changed = true;
+                }
                 self.storage[slot].expires_at = candidate.valid_until;
                 entry.ownership = RouteOwnership::Learned {
                     valid_until: candidate.valid_until,
@@ -483,6 +493,7 @@ impl Routes {
                 self.index
                     .push(IndexedRoute::learned(candidate, slot))
                     .expect("the IPv6 route index cannot exceed public route capacity");
+                changed = true;
             }
 
             selected_count += 1;
@@ -497,6 +508,32 @@ impl Routes {
             }
         }
         self.index.sort_unstable_by(IndexedRoute::sort_cmp);
+        if changed {
+            self.bump_revision();
+        }
+    }
+
+    /// Bump the generation counter of the authoritative public route table.
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Return the generation of the authoritative public route table.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Iterate over routers owned by learned entries in the public table.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn learned_router_addresses(&self) -> impl Iterator<Item = Ipv6Address> + '_ {
+        // Router-resolution pruning must use the same ownership sidecar
+        // as forwarding. Value-equal configured routes must not keep stale
+        // learned-router state alive after application edits.
+        self.index.iter().filter_map(|entry| {
+            matches!(entry.ownership, RouteOwnership::Learned { .. }).then_some(entry.via_router)
+        })
     }
 
     /// Add a default ipv4 gateway (ie. "ip route add 0.0.0.0/0 via `gateway`").
@@ -512,7 +549,10 @@ impl Routes {
             .push(Route::new_ipv4_gateway(gateway))
             .map_err(|_| RouteTableFull)?;
         #[cfg(feature = "proto-ipv6-rio")]
-        self.rebuild_route_index();
+        {
+            self.rebuild_route_index();
+            self.bump_revision();
+        }
         Ok(old)
     }
 
@@ -529,7 +569,10 @@ impl Routes {
             .push(Route::new_ipv6_gateway(gateway))
             .map_err(|_| RouteTableFull)?;
         #[cfg(feature = "proto-ipv6-rio")]
-        self.rebuild_route_index();
+        {
+            self.rebuild_route_index();
+            self.bump_revision();
+        }
         Ok(old)
     }
 
@@ -563,6 +606,7 @@ impl Routes {
         #[cfg(feature = "proto-ipv6-rio")]
         if removed.is_some() {
             self.rebuild_route_index();
+            self.bump_revision();
         }
         removed
     }
@@ -585,6 +629,7 @@ impl Routes {
         #[cfg(feature = "proto-ipv6-rio")]
         if removed.is_some() {
             self.rebuild_route_index();
+            self.bump_revision();
         }
         removed
     }

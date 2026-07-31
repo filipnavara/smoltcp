@@ -118,6 +118,8 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
+    #[cfg(feature = "proto-ipv6-rio")]
+    router_probe_deferred: bool,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -259,6 +261,8 @@ impl Interface {
                 reassembly_timeout: Duration::from_secs(60),
             },
             fragmenter: Fragmenter::new(),
+            #[cfg(feature = "proto-ipv6-rio")]
+            router_probe_deferred: false,
             inner: InterfaceInner {
                 now,
                 caps,
@@ -543,7 +547,27 @@ impl Interface {
         #[cfg(feature = "multicast")]
         self.multicast_egress(device);
 
-        self.socket_egress(device, sockets)
+        #[cfg(feature = "proto-ipv6-rio")]
+        let prioritize_router_probe = self.router_probe_deferred;
+        #[cfg(feature = "proto-ipv6-rio")]
+        if prioritize_router_probe {
+            // Normal egress had the first opportunity on the previous pass.
+            // Give a due probe that could not be sent one earlier attempt now
+            // so repeated normal traffic cannot starve router recovery.
+            self.router_probe_deferred = !self.ndisc_router_probe_egress(device);
+        }
+
+        let result = self.socket_egress(device, sockets);
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if !prioritize_router_probe {
+            // Recovery probes are advisory maintenance traffic, so try them
+            // after normal egress. A failed due attempt is remembered for one
+            // earlier opportunity on the next pass.
+            self.router_probe_deferred = !self.ndisc_router_probe_egress(device);
+        }
+
+        result
     }
 
     /// Process one incoming packet queued in the device.
@@ -618,6 +642,23 @@ impl Interface {
         #[cfg(feature = "proto-ipv6-slaac")]
         if self.inner.slaac_enabled {
             res = res.min(self.inner.slaac.poll_at(timestamp));
+        }
+
+        #[cfg(all(
+            feature = "proto-ipv6-rio",
+            any(feature = "medium-ethernet", feature = "medium-ieee802154")
+        ))]
+        {
+            // Deliberately does not prune resolution records against the
+            // current route table: this is a query, and both egress paths
+            // already synchronize before acting. A record left behind by a
+            // route change can only cause one early wakeup, which then prunes
+            // it, never a missed or incorrect probe.
+            res = res.min(
+                self.inner
+                    .neighbor_cache
+                    .router_resolution_poll_at(timestamp),
+            );
         }
 
         res
@@ -1030,7 +1071,6 @@ impl InterfaceInner {
             return Some(*addr);
         }
 
-        // Route via a router.
         #[cfg(feature = "proto-ipv6-rio")]
         let route = match addr {
             IpAddress::Ipv6(destination) => {
@@ -1044,20 +1084,107 @@ impl InterfaceInner {
         route
     }
 
-    /// Select an IPv6 next hop using the RFC 4191 rules.
-    ///
-    /// Only routes still present in the public table may influence forwarding.
-    /// The `Routes`-owned sidecar classifies learned entries during this single
-    /// scan, so application removals take effect immediately without a nested
-    /// ownership lookup.
     #[cfg(feature = "proto-ipv6-rio")]
     fn rio_route_selection(
         &self,
         destination: &Ipv6Address,
         timestamp: Instant,
     ) -> SlaacRouteSelection {
+        // Only routes still present in the public table may influence
+        // forwarding. The Routes-owned sidecar classifies learned entries
+        // during this single scan, so application removals take effect
+        // immediately without a nested ownership lookup.
         self.slaac
-            .lookup_route(&self.routes, destination, timestamp, |_router| false)
+            .lookup_route(&self.routes, destination, timestamp, |router| {
+                match self.caps.medium {
+                    #[cfg(feature = "medium-ethernet")]
+                    Medium::Ethernet => {
+                        self.neighbor_cache.is_router_unreachable(router, timestamp)
+                    }
+                    #[cfg(feature = "medium-ieee802154")]
+                    Medium::Ieee802154 => {
+                        self.neighbor_cache.is_router_unreachable(router, timestamp)
+                    }
+                    #[cfg(feature = "medium-ip")]
+                    Medium::Ip => false,
+                }
+            })
+    }
+
+    #[cfg(all(
+        feature = "proto-ipv6-rio",
+        any(feature = "medium-ethernet", feature = "medium-ieee802154")
+    ))]
+    fn router_probe_still_useful(
+        &self,
+        router: Ipv6Address,
+        destination: Ipv6Address,
+        timestamp: Instant,
+    ) -> bool {
+        let destination_addr = destination.into();
+        if self.in_same_network(&destination_addr) {
+            return false;
+        }
+        let selection = self.rio_route_selection(&destination, timestamp);
+        self.slaac
+            .recovery_probe_candidates(&self.routes, &destination, timestamp, selection)
+            .any(|candidate| candidate == router)
+    }
+
+    #[cfg(all(
+        feature = "proto-ipv6-rio",
+        any(feature = "medium-ethernet", feature = "medium-ieee802154")
+    ))]
+    fn request_recovery_probes(
+        &mut self,
+        destination: &Ipv6Address,
+        timestamp: Instant,
+        selection: SlaacRouteSelection,
+    ) -> bool {
+        let (routes, slaac, neighbor_cache) = (&self.routes, &self.slaac, &mut self.neighbor_cache);
+        let routes_revision = routes.revision();
+        neighbor_cache.sync_router_resolutions(routes_revision, routes.learned_router_addresses());
+        for router in slaac.recovery_probe_candidates(routes, destination, timestamp, selection) {
+            if neighbor_cache.is_router_unreachable(&router, timestamp)
+                && !neighbor_cache.request_router_probe(router, *destination, timestamp)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn route_with_rio_probes(&mut self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
+        if self.in_same_network(addr) {
+            return Some(*addr);
+        }
+
+        #[cfg(feature = "proto-ipv4")]
+        let destination = match addr {
+            IpAddress::Ipv6(destination) => destination,
+            IpAddress::Ipv4(_) => return self.routes.lookup(addr, timestamp),
+        };
+        #[cfg(not(feature = "proto-ipv4"))]
+        let IpAddress::Ipv6(destination) = addr;
+        let selection = self.rio_route_selection(destination, timestamp);
+
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        {
+            // One current useful-traffic witness per skipped router
+            // preserves probe authorization without retaining every
+            // destination or rescanning them when the bounded pool fills.
+            if !self.request_recovery_probes(destination, timestamp, selection) {
+                // The resolution pool is sized for every learned router, so
+                // this means router-resolution state and the public route
+                // table disagree. Recovery probing degrades; forwarding does
+                // not, so report it instead of aborting egress.
+                net_debug!(
+                    "RFC 4191: router-resolution storage could not retain every skipped router"
+                );
+            }
+        }
+        selection.next_hop
     }
 
     fn has_neighbor(&self, addr: &IpAddress) -> bool {
@@ -1140,6 +1267,11 @@ impl InterfaceInner {
             return Ok((hardware_addr, tx_token));
         }
 
+        #[cfg(feature = "proto-ipv6-rio")]
+        let dst_addr = self
+            .route_with_rio_probes(dst_addr, self.now)
+            .ok_or(DispatchError::NoRoute)?;
+        #[cfg(not(feature = "proto-ipv6-rio"))]
         let dst_addr = self
             .route(dst_addr, self.now)
             .ok_or(DispatchError::NoRoute)?;
@@ -1218,6 +1350,14 @@ impl InterfaceInner {
                 // can complete address resolution.
                 self.neighbor_cache
                     .record_neighbor_probe(dst_addr, self.now);
+
+                #[cfg(feature = "proto-ipv6-rio")]
+                if self.slaac.is_router(&self.routes, &dst_addr, self.now) {
+                    // Count only solicitations actually dispatched to learned
+                    // routers; failed sends and ordinary neighbor lookups are
+                    // not evidence that an RFC 4191 next hop is unreachable.
+                    self.neighbor_cache.record_router_probe(dst_addr, self.now);
+                }
             }
 
             #[allow(unreachable_patterns)]

@@ -664,6 +664,56 @@ impl Slaac {
         }
     }
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn is_recovery_probe_candidate(selection: RouteSelection, route: LearnedRoute) -> bool {
+        let Some(selected) = selection.selected else {
+            return false;
+        };
+        let (same_router, route_is_preferable) = match selected {
+            SelectedRoute::Configured(selected) => (
+                selected.via_router == route.via_router.into(),
+                // A configured route intentionally wins an equal-prefix tie,
+                // so only a longer learned prefix was skipped.
+                route.cidr.prefix_len() > selected.cidr.prefix_len(),
+            ),
+            SelectedRoute::Learned(selected) => {
+                let rank = (route.cidr.prefix_len(), route.preference.rank());
+                let selected_rank = (selected.cidr.prefix_len(), selected.preference.rank());
+                (
+                    selected.via_router == route.via_router,
+                    rank > selected_rank || (rank == selected_rank && route.order < selected.order),
+                )
+            }
+        };
+        !same_router && (selection.selected_is_unreachable || route_is_preferable)
+    }
+
+    /// Iterate over routes whose routers may need an RFC 4191 recovery probe.
+    ///
+    /// The caller filters by current reachability and coalesces repeated
+    /// routers. Yielding one entry per matching route keeps this scan linear;
+    /// de-duplicating here would rescan every earlier route on packet egress.
+    #[cfg(feature = "proto-ipv6-rio")]
+    pub(crate) fn recovery_probe_candidates<'a>(
+        &'a self,
+        routes: &'a Routes,
+        destination: &Ipv6Address,
+        now: Instant,
+        selection: RouteSelection,
+    ) -> impl Iterator<Item = Ipv6Address> + 'a {
+        let destination = IpAddress::Ipv6(*destination);
+        routes.iter().filter_map(move |route| {
+            let learned = routes.learned(route)?;
+            (Self::learned_route_is_valid(learned, now)
+                    && route.cidr.contains_addr(&destination)
+                    // Equal-ranked routes retain arrival order. An
+                    // unreachable route before the selected fallback would
+                    // have won if reachable and still needs a recovery probe.
+                    && Self::is_recovery_probe_candidate(selection, learned))
+            .then_some(learned.via_router)
+        })
+    }
+
     /// Invalidate every route through a node that is no longer a router.
     #[cfg(not(feature = "proto-ipv6-rio"))]
     pub(crate) fn remove_router(&mut self, address: &Ipv6Address) -> bool {
@@ -1728,12 +1778,27 @@ mod test {
         assert_eq!(selection(&[]).next_hop, Some(SOURCE.into()));
         let fallback = selection(&[SOURCE]);
         assert_eq!(fallback.next_hop, Some(SOURCE_2.into()));
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, fallback)
+            .filter(|router| [SOURCE].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE]);
 
         let default = selection(&[SOURCE, SOURCE_2]);
         assert_eq!(default.next_hop, Some(SOURCE_3.into()));
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, default)
+            .filter(|router| [SOURCE, SOURCE_2].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE, SOURCE_2]);
 
         let all_unreachable = selection(&[SOURCE, SOURCE_2, SOURCE_3]);
         assert_eq!(all_unreachable.next_hop, Some(SOURCE.into()));
+        let probes: Vec<_, SLAAC_ROUTE_CANDIDATE_COUNT> = slaac
+            .recovery_probe_candidates(&routes, &destination, now, all_unreachable)
+            .filter(|router| [SOURCE, SOURCE_2, SOURCE_3].contains(router))
+            .collect();
+        assert_eq!(probes.as_slice(), &[SOURCE_2, SOURCE_3]);
     }
 
     #[test]
@@ -1759,10 +1824,21 @@ mod test {
         let first_unreachable =
             slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE);
         assert_eq!(first_unreachable.next_hop, Some(SOURCE_2.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, first_unreachable)
+                .eq([SOURCE])
+        );
 
         let second_unreachable =
             slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE_2);
         assert_eq!(second_unreachable.next_hop, Some(SOURCE.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, second_unreachable)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2023,6 +2099,45 @@ mod test {
             Some(SOURCE_2.into())
         );
         assert!(!slaac.is_router(&routes, &SOURCE, now));
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn test_recovery_candidates_leave_router_coalescing_to_caller() {
+        let now = Instant::from_millis(1);
+        let destination = Ipv6Address::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 1);
+        let mut slaac = Slaac::new();
+        let more_specific = Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 0), 64);
+        let less_specific = Ipv6Cidr::new(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0), 48);
+
+        slaac.add_route(
+            &more_specific,
+            &SOURCE,
+            NdiscRoutePreference::High,
+            Some(now + VALID),
+        );
+        slaac.add_route(
+            &less_specific,
+            &SOURCE,
+            NdiscRoutePreference::High,
+            Some(now + VALID),
+        );
+        slaac.add_route(
+            &IPV6_DEFAULT,
+            &SOURCE_2,
+            NdiscRoutePreference::Medium,
+            Some(now + VALID),
+        );
+
+        let mut routes = Routes::new();
+        reconcile_routes(&mut slaac, &mut routes, now);
+        let selection = slaac.lookup_route(&routes, &destination, now, |router| *router == SOURCE);
+        assert_eq!(selection.next_hop, Some(SOURCE_2.into()));
+        assert!(
+            slaac
+                .recovery_probe_candidates(&routes, &destination, now, selection)
+                .eq([SOURCE, SOURCE])
+        );
     }
 
     #[test]
