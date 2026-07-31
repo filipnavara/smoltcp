@@ -37,6 +37,8 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
+#[cfg(feature = "proto-ipv6-rio")]
+use super::slaac::RouteSelection as SlaacRouteSelection;
 use super::socket_set::SocketSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT, IFACE_MAX_PREFIX_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
@@ -484,6 +486,15 @@ impl Interface {
                 PollIngressSingleResult::PacketProcessed => {}
                 PollIngressSingleResult::SocketStateChanged => res = PollResult::SocketStateChanged,
             }
+        }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        if self.inner.slaac.has_ra_update() {
+            // The maintenance pass above already handled timer-driven work.
+            // In a RIO-enabled build, synchronize only an ingress-triggered
+            // RA update here so the same poll uses it without repeating
+            // unrelated maintenance.
+            self.sync_slaac_state(timestamp);
         }
 
         // Process egress.
@@ -1020,7 +1031,33 @@ impl InterfaceInner {
         }
 
         // Route via a router.
-        self.routes.lookup(addr, timestamp)
+        #[cfg(feature = "proto-ipv6-rio")]
+        let route = match addr {
+            IpAddress::Ipv6(destination) => {
+                self.rio_route_selection(destination, timestamp).next_hop
+            }
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => self.routes.lookup(addr, timestamp),
+        };
+        #[cfg(not(feature = "proto-ipv6-rio"))]
+        let route = self.routes.lookup(addr, timestamp);
+        route
+    }
+
+    /// Select an IPv6 next hop using the RFC 4191 rules.
+    ///
+    /// Only routes still present in the public table may influence forwarding.
+    /// The `Routes`-owned sidecar classifies learned entries during this single
+    /// scan, so application removals take effect immediately without a nested
+    /// ownership lookup.
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn rio_route_selection(
+        &self,
+        destination: &Ipv6Address,
+        timestamp: Instant,
+    ) -> SlaacRouteSelection {
+        self.slaac
+            .lookup_route(&self.routes, destination, timestamp, |_router| false)
     }
 
     fn has_neighbor(&self, addr: &IpAddress) -> bool {

@@ -219,6 +219,28 @@ Enable [IPv4], [IPv6] and [6LoWPAN] respectively.
 [IPv6]: https://tools.ietf.org/rfc/rfc8200.txt
 [6LoWPAN]: https://tools.ietf.org/rfc/rfc6282.txt
 
+### Feature `proto-ipv6-slaac`
+
+Enable [IPv6 Stateless Address Autoconfiguration][SLAAC]. The interface derives
+addresses and a default route from received Router Advertisements. Requires
+`proto-ipv6`.
+
+[SLAAC]: https://tools.ietf.org/rfc/rfc4862.txt
+
+### Feature `proto-ipv6-rio`
+
+Enable [Default Router Preferences and More-Specific Routes][RFC 4191]. On top of
+`proto-ipv6-slaac`, the interface parses the Route Information Option and the
+Default Router Preference field of Router Advertisements, and installs the
+resulting more-specific routes. Implies `proto-ipv6-slaac`.
+
+Learned routes share the interface route table, so `IFACE_MAX_ROUTE_COUNT` must
+leave room for them in addition to any application-configured routes. A single
+advertisement may carry many Route Information Options, and the default of 2 is
+usually too small; routes that do not fit are refused and logged at debug level.
+
+[RFC 4191]: https://tools.ietf.org/rfc/rfc4191.txt
+
 ## Configuration
 
 _smoltcp_ has some configuration settings that are set at compile time, affecting sizes
@@ -255,6 +277,10 @@ Amount of "IP address -> hardware address" entries the neighbor cache (also know
 ### `IFACE_MAX_ROUTE_COUNT`
 
 Max amount of routes that can be added to one interface. Includes the default route. Includes both IPv4 and IPv6. Default: 2.
+
+With `proto-ipv6-rio`, routes learned from Route Information Options are stored
+here too, so this must be raised to accommodate them alongside the routes the
+application configures.
 
 ### `IFACE_MAX_PREFIX_COUNT`
 

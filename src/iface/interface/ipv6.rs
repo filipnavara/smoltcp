@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(not(feature = "proto-ipv6-rio"))]
 use crate::iface::Route;
 
 /// Enum used for the process_hopbyhop function. In some cases, when discarding a packet, an ICMP
@@ -447,6 +448,24 @@ impl InterfaceInner {
         }
     }
 
+    #[cfg(feature = "proto-ipv6-rio")]
+    fn reconcile_slaac_routes(&mut self, timestamp: Instant) {
+        let (slaac, routes) = (&mut self.slaac, &mut self.routes);
+        // Route-capacity-sized scratch vectors would make this maintenance
+        // path consume hundreds of kilobytes of stack at supported large
+        // capacities. Routes owns its learned sidecar and reconciles exact
+        // public entries in place, preserving unchanged route order.
+        //
+        // Reconciliation consumes the most useful candidates first, while RA
+        // updates rely on identity ordering for bounded logarithmic lookup.
+        // Temporarily sort here and restore that update invariant afterwards.
+        slaac.sort_learned_routes_by_usefulness();
+        routes.reconcile_learned(slaac.learned_route_count(), |index| {
+            slaac.learned_route_at(index, timestamp)
+        });
+        slaac.restore_learned_route_identity_order();
+    }
+
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(super) fn process_ndisc<'frame>(
         &mut self,
@@ -487,7 +506,22 @@ impl InterfaceInner {
                     // solicitation.
                     return None;
                 }
-                let _was_router = self.neighbor_cache.is_router(&target_addr, self.now);
+                let _was_router = self.neighbor_cache.is_router(&target_addr, self.now)
+                    || {
+                        #[cfg(feature = "proto-ipv6-rio")]
+                        {
+                            // A router being resolved for the first time has no
+                            // live cache entry yet, but the routes learned from
+                            // its advertisement are already installed.
+                            self.neighbor_cache
+                                .neighbor_probe_outstanding(&target_addr, self.now)
+                                && self.slaac.is_router(&self.routes, &target_addr, self.now)
+                        }
+                        #[cfg(not(feature = "proto-ipv6-rio"))]
+                        {
+                            false
+                        }
+                    };
                 let accepted = if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
                     if !lladdr.is_unicast() {
@@ -529,10 +563,12 @@ impl InterfaceInner {
                 );
 
                 #[cfg(feature = "proto-ipv6-slaac")]
-                if !is_router && _was_router {
+                if !is_router && _was_router && self.slaac.remove_router(&target_addr) {
                     // RFC 4861 section 7.2.5 invalidates routes only for a
-                    // TRUE-to-FALSE IsRouter transition.
-                    self.slaac.remove_router(&target_addr);
+                    // TRUE-to-FALSE IsRouter transition. Reconcile now so
+                    // queued egress cannot use the former router first.
+                    #[cfg(feature = "proto-ipv6-rio")]
+                    self.reconcile_slaac_routes(self.now);
                 }
 
                 None
@@ -584,7 +620,7 @@ impl InterfaceInner {
                 hop_limit: _,
                 flags: _,
                 #[cfg(feature = "proto-ipv6-rio")]
-                    preference: _,
+                preference,
                 router_lifetime,
                 reachable_time: _,
                 retrans_time: _,
@@ -592,7 +628,7 @@ impl InterfaceInner {
                 mtu: _,
                 prefix_info,
                 #[cfg(feature = "proto-ipv6-rio")]
-                    route_info: _,
+                route_info,
             } if self.slaac_enabled => {
                 if ip_repr.src_addr.is_link_local()
                     && (ip_repr.dst_addr == IPV6_LINK_LOCAL_ALL_NODES
@@ -627,7 +663,11 @@ impl InterfaceInner {
                     self.slaac.process_advertisement(
                         &ip_repr.src_addr,
                         router_lifetime,
+                        #[cfg(feature = "proto-ipv6-rio")]
+                        preference,
                         prefix_info,
+                        #[cfg(feature = "proto-ipv6-rio")]
+                        route_info,
                         self.now,
                     )
                 }
@@ -744,51 +784,73 @@ impl Interface {
             })
             .collect();
 
-        self.update_ip_addrs(|addresses| {
-            for address in required_addresses {
-                if !addresses.contains(&IpCidr::Ipv6(address)) {
-                    let _ = addresses.push(IpCidr::Ipv6(address));
-                }
+        // SLAAC changes addresses on the existing link; it does not move the
+        // interface to a different neighbor domain. Unlike `update_ip_addrs`,
+        // this deliberately does not flush the neighbor cache, which would
+        // otherwise discard the router mapping and IsRouter state learned from
+        // the very advertisement that triggered this synchronization.
+        for address in required_addresses {
+            if !self.inner.ip_addrs.contains(&IpCidr::Ipv6(address)) {
+                let _ = self.inner.ip_addrs.push(IpCidr::Ipv6(address));
             }
-            addresses.retain(|address| {
-                if let IpCidr::Ipv6(address) = address {
-                    !removed_addresses.contains(address)
-                } else {
-                    true
-                }
-            });
+        }
+        self.inner.ip_addrs.retain(|address| match address {
+            IpCidr::Ipv6(address) => !removed_addresses.contains(address),
+            #[cfg(feature = "proto-ipv4")]
+            IpCidr::Ipv4(_) => true,
         });
+        InterfaceInner::check_ip_addrs(&self.inner.ip_addrs);
 
+        #[cfg(all(feature = "multicast", feature = "medium-ethernet"))]
+        if self.inner.caps.medium == Medium::Ethernet {
+            self.update_solicited_node_groups();
+        }
+
+        #[cfg(feature = "proto-ipv6-rio")]
+        self.inner.reconcile_slaac_routes(timestamp);
+
+        #[cfg(not(feature = "proto-ipv6-rio"))]
         {
+            // Keep the mirror flow when RIO is disabled. RIO needs explicit
+            // ownership and expiry metadata, but applying that flow here would
+            // reorder equal-prefix application routes on each RA lifetime
+            // refresh and enlarge the default SLAAC state.
             let required_routes = self
                 .inner
                 .slaac
                 .routes()
-                .into_iter()
-                .filter(|required| required.is_valid(timestamp));
-
+                .iter()
+                .filter(|route| route.is_valid(timestamp));
             let removed_routes = self
                 .inner
                 .slaac
                 .routes()
-                .into_iter()
-                .filter(|r| !r.is_valid(timestamp));
+                .iter()
+                .filter(|route| !route.is_valid(timestamp));
 
             self.inner.routes.update(|routes| {
-                routes.retain(|r| match (&r.cidr, &r.via_router) {
+                routes.retain(|route| match (&route.cidr, &route.via_router) {
                     (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => !removed_routes
                         .clone()
-                        .any(|f| f.same_route(cidr, via_router)),
+                        .any(|removed| removed.same_route(cidr, via_router)),
+                    #[cfg(feature = "proto-ipv4")]
                     _ => true,
                 });
 
                 for route in required_routes {
-                    if routes.iter().all(|r| match (&r.cidr, &r.via_router) {
-                        (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
-                            !route.same_route(cidr, via_router)
-                        }
-                        _ => false,
-                    }) {
+                    if routes
+                        .iter()
+                        .all(|existing| match (&existing.cidr, &existing.via_router) {
+                            (IpCidr::Ipv6(cidr), IpAddress::Ipv6(via_router)) => {
+                                !route.same_route(cidr, via_router)
+                            }
+                            #[cfg(feature = "proto-ipv4")]
+                            // This predicate deliberately stops at a route from
+                            // the other address family; changing that behavior
+                            // is independent of RFC 4191 support.
+                            _ => false,
+                        })
+                    {
                         let _ = routes.push(Route {
                             cidr: route.cidr.into(),
                             via_router: route.via_router.into(),
